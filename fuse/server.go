@@ -63,7 +63,8 @@ type Server struct {
 	reqPool sync.Pool
 
 	// Pool for raw requests data
-	readPool   sync.Pool
+	readPool sync.Pool
+
 	reqMu      sync.Mutex
 	reqReaders int
 
@@ -340,7 +341,7 @@ func handleEINTR(fn func() error) (err error) {
 
 // Returns a new request, or error. Returns
 // nil, OK if we have too many readers already.
-func (ms *Server) readRequest() (req *requestAlloc, code Status) {
+func (ms *Server) readRequest() (*requestAlloc, Status) {
 	ms.reqMu.Lock()
 	if ms.reqReaders > ms.maxReaders {
 		ms.reqMu.Unlock()
@@ -350,7 +351,7 @@ func (ms *Server) readRequest() (req *requestAlloc, code Status) {
 	ms.reqMu.Unlock()
 
 	reqIface := ms.reqPool.Get()
-	req = reqIface.(*requestAlloc)
+	req := reqIface.(*requestAlloc)
 	destIface := ms.readPool.Get()
 	dest := destIface.([]byte)
 
@@ -361,12 +362,12 @@ func (ms *Server) readRequest() (req *requestAlloc, code Status) {
 		return err
 	})
 	if err != nil {
-		code = ToStatus(err)
-		ms.reqPool.Put(reqIface)
+		ms.reqPool.Put(req)
+		ms.readPool.Put(dest)
 		ms.reqMu.Lock()
 		ms.reqReaders--
 		ms.reqMu.Unlock()
-		return nil, code
+		return nil, ToStatus(err)
 	}
 
 	if ms.latencies != nil {
@@ -377,6 +378,9 @@ func (ms *Server) readRequest() (req *requestAlloc, code Status) {
 	gobbled := req.setInput(dest[:n])
 	if len(req.inputBuf) < int(unsafe.Sizeof(InHeader{})) {
 		log.Printf("Short read for input header: %v", req.inputBuf)
+		ms.reqPool.Put(req)
+		ms.readPool.Put(dest)
+		ms.reqReaders--
 		return nil, EINVAL
 	}
 	opCode := ((*InHeader)(unsafe.Pointer(&req.inputBuf[0]))).Opcode
@@ -387,7 +391,7 @@ func (ms *Server) readRequest() (req *requestAlloc, code Status) {
 	needsBackPressure := (opCode == _OP_FORGET || opCode == _OP_BATCH_FORGET)
 
 	if !gobbled {
-		ms.readPool.Put(destIface)
+		ms.readPool.Put(dest)
 	}
 	ms.reqReaders--
 	if !ms.singleReader && ms.reqReaders <= 0 && !needsBackPressure {
@@ -402,20 +406,22 @@ func (ms *Server) readRequest() (req *requestAlloc, code Status) {
 func (ms *Server) returnRequest(req *requestAlloc) {
 	ms.recordStats(&req.request)
 
-	if req.bufferPoolOutputBuf != nil {
-		ms.buffers.FreeBuffer(req.bufferPoolOutputBuf)
+	if buf := req.bufferPoolOutputBuf; buf != nil {
 		req.bufferPoolOutputBuf = nil
+		ms.buffers.FreeBuffer(buf)
 	}
+
+	if buf := req.bufferPoolInputBuf; buf != nil {
+		req.bufferPoolInputBuf = nil
+		ms.readPool.Put(buf)
+	}
+
 	if req.interrupted {
 		req.interrupted = false
 		req.cancel = make(chan struct{}, 0)
 	}
-	req.clear()
 
-	if p := req.bufferPoolInputBuf; p != nil {
-		req.bufferPoolInputBuf = nil
-		ms.readPool.Put(p)
-	}
+	req.clear()
 	ms.reqPool.Put(req)
 }
 
@@ -578,8 +584,8 @@ func (ms *Server) handleRequest(req *requestAlloc) Status {
 	req.outputBuf = req.outBuf[:outSize+int(sizeOfOutHeader)]
 	copy(req.outputBuf, zeroOutBuf[:])
 	if outPayloadSize > 0 {
-		req.outPayload = ms.buffers.AllocBuffer(uint32(outPayloadSize))
-		req.bufferPoolOutputBuf = req.outPayload
+		req.bufferPoolOutputBuf = ms.buffers.AllocBuffer(uint32(outPayloadSize))
+		req.outPayload = req.bufferPoolOutputBuf
 	}
 	ms.protocolServer.handleRequest(h, &req.request)
 	if req.suppressReply {
