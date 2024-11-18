@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/hanwen/go-fuse/v2/util/zeropool"
 )
 
 const (
@@ -58,10 +60,10 @@ type Server struct {
 	buffers bufferPool
 
 	// Pool for request structs.
-	reqPool sync.Pool
+	reqPool zeropool.Pool[*requestAlloc]
 
 	// Pool for raw requests data
-	readPool   sync.Pool
+	readPool   zeropool.Pool[[]byte]
 	reqMu      sync.Mutex
 	reqReaders int
 
@@ -208,14 +210,14 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		singleReader: useSingleReader,
 		ready:        make(chan error, 1),
 	}
-	ms.reqPool.New = func() interface{} {
+	ms.reqPool = zeropool.New[*requestAlloc](func() *requestAlloc {
 		return &requestAlloc{
 			request: request{
 				cancel: make(chan struct{}),
 			},
 		}
-	}
-	ms.readPool.New = func() interface{} {
+	})
+	ms.readPool = zeropool.New[[]byte](func() []byte {
 		targetSize := o.MaxWrite + int(maxInputSize)
 		if targetSize < _FUSE_MIN_READ_BUFFER {
 			targetSize = _FUSE_MIN_READ_BUFFER
@@ -227,7 +229,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		buf := make([]byte, targetSize+logicalBlockSize)
 		buf = alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(targetSize))
 		return buf
-	}
+	})
 	mountPoint = filepath.Clean(mountPoint)
 	if !filepath.IsAbs(mountPoint) {
 		cwd, err := os.Getwd()
@@ -325,7 +327,9 @@ func handleEINTR(fn func() error) (err error) {
 
 // Returns a new request, or error. In case exitIdle is given, returns
 // nil, OK if we have too many readers already.
-func (ms *Server) readRequest(exitIdle bool) (req *requestAlloc, code Status) {
+func (ms *Server) readRequest(exitIdle bool) (*requestAlloc, Status) {
+	code := OK
+
 	ms.reqMu.Lock()
 	if ms.reqReaders > ms.maxReaders {
 		ms.reqMu.Unlock()
@@ -334,10 +338,16 @@ func (ms *Server) readRequest(exitIdle bool) (req *requestAlloc, code Status) {
 	ms.reqReaders++
 	ms.reqMu.Unlock()
 
-	reqIface := ms.reqPool.Get()
-	req = reqIface.(*requestAlloc)
-	destIface := ms.readPool.Get()
-	dest := destIface.([]byte)
+	req := ms.reqPool.Get()
+	dest := ms.readPool.Get()
+
+	defer func() {
+		if code != OK {
+			req.clear()
+			ms.reqPool.Put(req)
+			ms.readPool.Put(dest)
+		}
+	}()
 
 	var n int
 	err := handleEINTR(func() error {
@@ -347,7 +357,6 @@ func (ms *Server) readRequest(exitIdle bool) (req *requestAlloc, code Status) {
 	})
 	if err != nil {
 		code = ToStatus(err)
-		ms.reqPool.Put(reqIface)
 		ms.reqMu.Lock()
 		ms.reqReaders--
 		ms.reqMu.Unlock()
@@ -361,12 +370,13 @@ func (ms *Server) readRequest(exitIdle bool) (req *requestAlloc, code Status) {
 	defer ms.reqMu.Unlock()
 	gobbled := req.setInput(dest[:n])
 	if len(req.inputBuf) < int(unsafe.Sizeof(InHeader{})) {
+		code = EINVAL
 		log.Printf("Short read for input header: %v", req.inputBuf)
-		return nil, EINVAL
+		return nil, code
 	}
 
 	if !gobbled {
-		ms.readPool.Put(destIface)
+		ms.readPool.Put(dest)
 	}
 	ms.reqReaders--
 	if !ms.singleReader && ms.reqReaders <= 0 {
@@ -374,27 +384,33 @@ func (ms *Server) readRequest(exitIdle bool) (req *requestAlloc, code Status) {
 		go ms.loop(true)
 	}
 
-	return req, OK
+	return req, code
 }
 
 // returnRequest returns a request to the pool of unused requests.
 func (ms *Server) returnRequest(req *requestAlloc) {
 	ms.recordStats(&req.request)
 
-	if req.bufferPoolOutputBuf != nil {
-		ms.buffers.FreeBuffer(req.bufferPoolOutputBuf)
+	if buf := req.bufferPoolOutputBuf; buf != nil {
 		req.bufferPoolOutputBuf = nil
+		if cap(buf) > 0 {
+			ms.buffers.FreeBuffer(buf)
+		}
 	}
+
+	if buf := req.bufferPoolInputBuf; buf != nil {
+		req.bufferPoolInputBuf = nil
+		if cap(buf) > 0 {
+			ms.readPool.Put(buf)
+		}
+	}
+
 	if req.interrupted {
 		req.interrupted = false
 		req.cancel = make(chan struct{}, 0)
 	}
-	req.clear()
 
-	if p := req.bufferPoolInputBuf; p != nil {
-		req.bufferPoolInputBuf = nil
-		ms.readPool.Put(p)
-	}
+	req.clear()
 	ms.reqPool.Put(req)
 }
 
@@ -555,8 +571,8 @@ func (ms *Server) handleRequest(req *requestAlloc) Status {
 	req.outputBuf = req.outBuf[:outSize+int(sizeOfOutHeader)]
 	copy(req.outputBuf, zeroOutBuf[:])
 	if outPayloadSize > 0 {
-		req.outPayload = ms.buffers.AllocBuffer(uint32(outPayloadSize))
-		req.bufferPoolOutputBuf = req.outPayload
+		req.bufferPoolOutputBuf = ms.buffers.AllocBuffer(uint32(outPayloadSize))
+		req.outPayload = req.bufferPoolOutputBuf
 	}
 	ms.protocolServer.handleRequest(h, &req.request)
 	if req.suppressReply {

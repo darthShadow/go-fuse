@@ -68,7 +68,7 @@ type requestAlloc struct {
 	outBuf [outputHeaderSize]byte
 
 	// Input, if small enough to fit here.
-	smallInputBuf [128]byte
+	smallInputBuf [64]byte
 }
 
 func (r *request) inHeader() *InHeader {
@@ -179,6 +179,7 @@ func (r *requestAlloc) setInput(input []byte) bool {
 		r.inputBuf = r.smallInputBuf[:len(input)]
 		return false
 	}
+
 	r.inputBuf = input
 	r.bufferPoolInputBuf = input[:cap(input)]
 
