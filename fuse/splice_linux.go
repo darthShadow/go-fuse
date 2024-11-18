@@ -11,8 +11,8 @@ import (
 	"github.com/hanwen/go-fuse/v2/splice"
 )
 
-func (s *Server) setSplice() {
-	s.canSplice = splice.Resizable() && !s.opts.DisableSplice
+func (ms *Server) setSplice() {
+	ms.canSplice = splice.Resizable() && !ms.opts.DisableSplice
 }
 
 // trySplice:  Zero-copy read from fdData.Fd into /dev/fuse
