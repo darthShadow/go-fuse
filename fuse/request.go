@@ -92,6 +92,15 @@ func (r *request) clear() {
 	r.readResult = nil
 }
 
+func (r *requestAlloc) clear() {
+	r.request.clear()
+	r.bufferPoolInputBuf = nil
+	r.bufferPoolOutputBuf = nil
+	clear(r.outHeaderInline[:])
+	clear(r.outDataInline[:])
+	clear(r.smallInputBuf[:])
+}
+
 func asType(ptr unsafe.Pointer, typ interface{}) interface{} {
 	return reflect.NewAt(reflect.ValueOf(typ).Type(), ptr).Interface()
 }
@@ -190,11 +199,12 @@ func (r *request) OutputDebug() string {
 
 // setInput returns true if it takes ownership of the argument, false if not.
 func (r *requestAlloc) setInput(input []byte) bool {
-	if len(input) < len(r.smallInputBuf) {
+	if len(input) < cap(r.smallInputBuf) {
 		copy(r.smallInputBuf[:], input)
 		r.inputBuf = r.smallInputBuf[:len(input)]
 		return false
 	}
+
 	r.inputBuf = input
 	r.bufferPoolInputBuf = input[:cap(input)]
 
