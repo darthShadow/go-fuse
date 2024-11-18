@@ -486,15 +486,17 @@ func (ms *Server) returnRequest(req *requestAlloc) {
 		ms.buffers.FreeBuffer(req.bufferPoolOutputBuf)
 		req.bufferPoolOutputBuf = nil
 	}
+
 	if req.interrupted {
 		req.interrupted = false
 		req.cancel = make(chan struct{}, 0)
 	}
+	p := req.bufferPoolInputBuf
+	req.bufferPoolInputBuf = nil
 	req.clear()
 
 	ms.reqMu.Lock()
-	if p := req.bufferPoolInputBuf; p != nil {
-		req.bufferPoolInputBuf = nil
+	if p != nil {
 		ms.putReadBuf(p)
 	}
 	ms.putReq(req)
@@ -668,8 +670,8 @@ func (ms *Server) handleRequest(req *requestAlloc) Status {
 	clear(req.outHeaderBuf)
 	clear(req.outDataBuf)
 	if outPayloadSize > 0 {
-		req.outPayload = ms.buffers.AllocBuffer(uint32(outPayloadSize))
-		req.bufferPoolOutputBuf = req.outPayload
+		req.bufferPoolOutputBuf = ms.buffers.AllocBuffer(uint32(outPayloadSize))
+		req.outPayload = req.bufferPoolOutputBuf
 	}
 	ms.protocolServer.handleRequest(h, &req.request)
 	if req.suppressReply {
