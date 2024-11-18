@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/hanwen/go-fuse/v2/util/zeropool"
 )
 
 const (
@@ -61,7 +63,7 @@ type Server struct {
 	reqPool sync.Pool
 
 	// Pool for raw requests data
-	readPool   sync.Pool
+	readPool   zeropool.Pool[[]byte]
 	reqMu      sync.Mutex
 	reqReaders int
 
@@ -215,7 +217,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			},
 		}
 	}
-	ms.readPool.New = func() interface{} {
+	ms.readPool = zeropool.New[[]byte](func() []byte {
 		targetSize := o.MaxWrite + int(maxInputSize)
 		if targetSize < _FUSE_MIN_READ_BUFFER {
 			targetSize = _FUSE_MIN_READ_BUFFER
@@ -227,7 +229,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		buf := make([]byte, targetSize+logicalBlockSize)
 		buf = alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(targetSize))
 		return buf
-	}
+	})
 	mountPoint = filepath.Clean(mountPoint)
 	if !filepath.IsAbs(mountPoint) {
 		cwd, err := os.Getwd()
@@ -336,8 +338,17 @@ func (ms *Server) readRequest(exitIdle bool) (req *requestAlloc, code Status) {
 
 	reqIface := ms.reqPool.Get()
 	req = reqIface.(*requestAlloc)
-	destIface := ms.readPool.Get()
-	dest := destIface.([]byte)
+	dest := ms.readPool.Get()
+
+	defer func() {
+		if code != OK {
+			if req != nil {
+				req.clear()
+				ms.reqPool.Put(req)
+			}
+			ms.readPool.Put(dest)
+		}
+	}()
 
 	var n int
 	err := handleEINTR(func() error {
@@ -347,7 +358,6 @@ func (ms *Server) readRequest(exitIdle bool) (req *requestAlloc, code Status) {
 	})
 	if err != nil {
 		code = ToStatus(err)
-		ms.reqPool.Put(reqIface)
 		ms.reqMu.Lock()
 		ms.reqReaders--
 		ms.reqMu.Unlock()
@@ -366,7 +376,7 @@ func (ms *Server) readRequest(exitIdle bool) (req *requestAlloc, code Status) {
 	}
 
 	if !gobbled {
-		ms.readPool.Put(destIface)
+		ms.readPool.Put(dest)
 	}
 	ms.reqReaders--
 	if !ms.singleReader && ms.reqReaders <= 0 {
@@ -381,20 +391,22 @@ func (ms *Server) readRequest(exitIdle bool) (req *requestAlloc, code Status) {
 func (ms *Server) returnRequest(req *requestAlloc) {
 	ms.recordStats(&req.request)
 
-	if req.bufferPoolOutputBuf != nil {
-		ms.buffers.FreeBuffer(req.bufferPoolOutputBuf)
+	if buf := req.bufferPoolOutputBuf; buf != nil {
 		req.bufferPoolOutputBuf = nil
+		ms.buffers.FreeBuffer(buf)
 	}
+
+	if buf := req.bufferPoolInputBuf; buf != nil {
+		req.bufferPoolInputBuf = nil
+		ms.readPool.Put(buf)
+	}
+
 	if req.interrupted {
 		req.interrupted = false
 		req.cancel = make(chan struct{}, 0)
 	}
-	req.clear()
 
-	if p := req.bufferPoolInputBuf; p != nil {
-		req.bufferPoolInputBuf = nil
-		ms.readPool.Put(p)
-	}
+	req.clear()
 	ms.reqPool.Put(req)
 }
 
@@ -555,8 +567,8 @@ func (ms *Server) handleRequest(req *requestAlloc) Status {
 	req.outputBuf = req.outBuf[:outSize+int(sizeOfOutHeader)]
 	copy(req.outputBuf, zeroOutBuf[:])
 	if outPayloadSize > 0 {
-		req.outPayload = ms.buffers.AllocBuffer(uint32(outPayloadSize))
-		req.bufferPoolOutputBuf = req.outPayload
+		req.bufferPoolOutputBuf = ms.buffers.AllocBuffer(uint32(outPayloadSize))
+		req.outPayload = req.bufferPoolOutputBuf
 	}
 	ms.protocolServer.handleRequest(h, &req.request)
 	if req.suppressReply {

@@ -19,6 +19,12 @@ type bufferPool struct {
 
 	// Number of outstanding allocations. Used for testing.
 	countersBySize []int
+
+	ptrs sync.Pool
+}
+
+type bufPtr struct {
+	buf []byte
 }
 
 var pageSize = os.Getpagesize()
@@ -40,9 +46,7 @@ func (p *bufferPool) getPool(pageCount int, delta int) *sync.Pool {
 		p.countersBySize = append(p.countersBySize, 0)
 	}
 	if p.buffersBySize[pageCount] == nil {
-		p.buffersBySize[pageCount] = &sync.Pool{
-			New: func() interface{} { return make([]byte, pageSize*pageCount) },
-		}
+		p.buffersBySize[pageCount] = new(sync.Pool)
 	}
 	p.countersBySize[pageCount] += delta
 	return p.buffersBySize[pageCount]
@@ -61,22 +65,36 @@ func (p *bufferPool) AllocBuffer(size uint32) []byte {
 	}
 	pages := sz / pageSize
 
-	b := p.getPool(pages, 1).Get().([]byte)
-	return b[:size]
+	if ptr := p.getPool(pages, 1).Get(); ptr != nil {
+		bp := ptr.(*bufPtr)
+		buf := bp.buf[:size]
+		bp.buf = nil
+		p.ptrs.Put(ptr)
+		return buf
+
+	}
+
+	return make([]byte, pageSize*pages)[:size]
 }
 
 // FreeBuffer takes back a buffer if it was allocated through
 // AllocBuffer.  It is not an error to call FreeBuffer() on a slice
 // obtained elsewhere.
 func (p *bufferPool) FreeBuffer(slice []byte) {
-	if slice == nil {
+	if slice == nil || cap(slice)%pageSize != 0 || cap(slice) == 0 {
 		return
 	}
-	if cap(slice)%pageSize != 0 || cap(slice) == 0 {
-		return
-	}
-	pages := cap(slice) / pageSize
+
 	slice = slice[:cap(slice)]
 
-	p.getPool(pages, -1).Put(slice)
+	var bp *bufPtr
+	if ptr := p.ptrs.Get(); ptr != nil {
+		bp = ptr.(*bufPtr)
+	} else {
+		bp = new(bufPtr)
+	}
+	bp.buf = slice
+
+	pages := cap(slice) / pageSize
+	p.getPool(pages, -1).Put(bp)
 }

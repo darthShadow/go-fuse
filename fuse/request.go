@@ -67,8 +67,8 @@ type requestAlloc struct {
 	// Output header and structured data.
 	outBuf [outputHeaderSize]byte
 
-	// Input, if small enough to fit here.
-	smallInputBuf [128]byte
+	//// Input, if small enough to fit here.
+	//smallInputBuf [128]byte
 }
 
 func (r *request) inHeader() *InHeader {
@@ -174,11 +174,12 @@ func (r *request) OutputDebug() string {
 
 // setInput returns true if it takes ownership of the argument, false if not.
 func (r *requestAlloc) setInput(input []byte) bool {
-	if len(input) < len(r.smallInputBuf) {
-		copy(r.smallInputBuf[:], input)
-		r.inputBuf = r.smallInputBuf[:len(input)]
-		return false
-	}
+	//if len(input) < len(r.smallInputBuf) {
+	//	copy(r.smallInputBuf[:], input)
+	//	r.inputBuf = r.smallInputBuf[:len(input)]
+	//	return false
+	//}
+
 	r.inputBuf = input
 	r.bufferPoolInputBuf = input[:cap(input)]
 
