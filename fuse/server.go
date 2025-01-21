@@ -63,7 +63,7 @@ type Server struct {
 	reqPool sync.Pool
 
 	// Pool for raw requests data
-	readPool sync.Pool
+	readPool bytePool
 
 	reqMu      sync.Mutex
 	reqReaders int
@@ -232,7 +232,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			},
 		}
 	}
-	ms.readPool.New = func() interface{} {
+	ms.readPool = newBytePool(maxReaders*2, func() interface{} {
 		targetSize := o.MaxWrite + int(maxInputSize)
 		if targetSize < _FUSE_MIN_READ_BUFFER {
 			targetSize = _FUSE_MIN_READ_BUFFER
@@ -244,7 +244,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		buf := make([]byte, targetSize+logicalBlockSize)
 		buf = alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(targetSize))
 		return buf
-	}
+	})
 	mountPoint = filepath.Clean(mountPoint)
 	if !filepath.IsAbs(mountPoint) {
 		cwd, err := os.Getwd()
@@ -365,8 +365,7 @@ func (ms *Server) readRequest() (*requestAlloc, Status) {
 
 	reqIface := ms.reqPool.Get()
 	req := reqIface.(*requestAlloc)
-	destIface := ms.readPool.Get()
-	dest := destIface.([]byte)
+	dest := ms.readPool.Get()
 
 	var n int
 	err := handleEINTR(func() error {
