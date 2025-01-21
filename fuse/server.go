@@ -65,7 +65,7 @@ type Server struct {
 	reqAllocBytes int
 
 	// Pool for raw requests data
-	readPool sync.Pool
+	readPool bytePool
 	// readBufBytes is constant after NewServer, so it can be used for accounting.
 	readBufBytes         int
 	inflightRequestBytes int
@@ -264,15 +264,13 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			},
 		}
 	}
-	ms.readPool.New = func() interface{} {
-		// O_DIRECT typically requires buffers aligned to
-		// blocksize (see man 2 open), but requirements vary
-		// across file systems. Presumably, we could also fix
-		// this by reading the requests using readv.
+	ms.readPool = newBytePool(maxReaders*2, func() interface{} {
+		// O_DIRECT alignment; sized via requestAccountingSizes so the bytePool
+		// allocator and inflight accounting share one size source.
 		buf := make([]byte, readBufBytes)
 		buf = alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(readBufSize))
 		return buf
-	}
+	})
 	mountPoint = filepath.Clean(mountPoint)
 	if !filepath.IsAbs(mountPoint) {
 		cwd, err := os.Getwd()
@@ -402,7 +400,7 @@ func (ms *Server) readRequest() (req *requestAlloc, code Status) {
 	ms.reqMu.Unlock()
 
 	req = ms.reqPool.Get().(*requestAlloc)
-	dest := ms.readPool.Get().([]byte)
+	dest := ms.readPool.Get()
 
 	var n int
 	err := handleEINTR(func() error {
