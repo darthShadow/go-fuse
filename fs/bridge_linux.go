@@ -31,7 +31,8 @@ func (b *rawBridge) setStatxTimeout(out *fuse.StatxOut) {
 }
 
 func (b *rawBridge) Statx(cancel <-chan struct{}, in *fuse.StatxIn, out *fuse.StatxOut) fuse.Status {
-	n, fe := b.inode(in.NodeId, in.Fh)
+	n := b.getNode(in.NodeId)
+	fe := b.getFile(in.Fh)
 	var fh FileHandle
 	if fe != nil {
 		fh = fe.file

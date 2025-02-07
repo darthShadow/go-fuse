@@ -429,8 +429,8 @@ func (n *Inode) removeRefInner(nlookup uint64, dropPersistence bool, inputUnused
 	if n.lookupCount == 0 {
 		// Dropping the node from stableAttrs guarantees that no new references to this node are
 		// handed out to the kernel, hence we can also safely delete it from kernelNodeIds.
-		delete(n.bridge.stableAttrs, n.stableAttr)
-		delete(n.bridge.kernelNodeIds, n.nodeId)
+		n.bridge._removeStableNode(n.stableAttr)
+		n.bridge._removeNode(n.nodeId)
 	}
 	n.bridge.mu.Unlock()
 
