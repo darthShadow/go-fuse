@@ -264,7 +264,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			},
 		}
 	}
-	ms.readPool = newBytePool(maxReaders*2, func() interface{} {
+	ms.readPool = newBytePool(readPoolMaxRetainedBuffers, func() interface{} {
 		// O_DIRECT alignment; sized via requestAccountingSizes so the bytePool
 		// allocator and inflight accounting share one size source.
 		buf := make([]byte, readBufBytes)
