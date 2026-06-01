@@ -3,46 +3,134 @@ package fuse
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/internal/testutil"
 )
 
+type manualBytePoolClock struct {
+	now time.Time
+}
+
+func newManualBytePoolClock() *manualBytePoolClock {
+	return &manualBytePoolClock{now: time.Unix(0, 0)}
+}
+
+func (c *manualBytePoolClock) Now() time.Time {
+	return c.now
+}
+
+func (c *manualBytePoolClock) Advance(d time.Duration) {
+	c.now = c.now.Add(d)
+}
+
 func TestBytePool(t *testing.T) {
-	var size = 4
-	var width = 10
+	size := 4
+	width := 10
+	clock := newManualBytePoolClock()
 
-	bufPool := newBytePool(size, func() interface{} {
+	bufPool := newBytePoolWithClock(size, func() interface{} {
 		return make([]byte, width)
-	})
+	}, clock.Now)
 
-	// Check that retrieved buffer are of the expected width
 	b := bufPool.Get()
 	if len(b) != width {
 		t.Fatalf("bytepool length invalid: got %v want %v", len(b), width)
 	}
 
-	// Try putting a short slice into pool
-	bufPool.Put(make([]byte, width)[:2])
-	if len(bufPool.channel) != 1 {
-		t.Fatal("bytepool should have accepted short slice with sufficient capacity")
+	bufPool.Put(b[:2])
+	if got := bufPool.NumPooled(); got != 1 {
+		t.Fatalf("bytepool should have accepted short slice with sufficient capacity: got %v want %v", got, 1)
 	}
 
 	b = bufPool.Get()
 	if len(b) != width {
-		t.Fatalf("bytepool length invalid: got %v want %v", len(b), width)
+		t.Fatalf("bytepool length invalid after reuse: got %v want %v", len(b), width)
 	}
 
-	// Fill the pool beyond the capped pool size.
+	held := [][]byte{b}
 	for i := 0; i < size*2; i++ {
-		bufPool.Put(make([]byte, width))
+		held = append(held, bufPool.Get())
+	}
+	for _, b := range held {
+		bufPool.Put(b)
 	}
 
-	// Close the channel so we can iterate over it.
-	close(bufPool.channel)
+	if got := bufPool.NumPooled(); got != size {
+		t.Fatalf("bytepool retained size invalid: got %v want %v", got, size)
+	}
+}
 
-	// Check the size of the pool.
-	if bufPool.NumPooled() != size {
-		t.Fatalf("bytepool size invalid: got %v want %v", len(bufPool.channel), size)
+func TestBytePoolReclaimsWhileServing(t *testing.T) {
+	maxRetained := 8
+	workingSet := 2
+	width := 10
+	clock := newManualBytePoolClock()
+
+	bufPool := newBytePoolWithClock(maxRetained, func() interface{} {
+		return make([]byte, width)
+	}, clock.Now)
+
+	burst := make([][]byte, 0, maxRetained)
+	for i := 0; i < maxRetained; i++ {
+		burst = append(burst, bufPool.Get())
+	}
+	for _, b := range burst {
+		bufPool.Put(b)
+	}
+	if got := bufPool.NumPooled(); got != maxRetained {
+		t.Fatalf("bytepool burst retained size invalid: got %v want %v", got, maxRetained)
+	}
+
+	active := make([][]byte, 0, workingSet)
+	for i := 0; i < workingSet; i++ {
+		active = append(active, bufPool.Get())
+	}
+	if got, want := bufPool.NumPooled(), maxRetained-workingSet; got != want {
+		t.Fatalf("bytepool retained size after steady gets invalid: got %v want %v", got, want)
+	}
+
+	for i := 0; i < maxRetained-workingSet+2; i++ {
+		clock.Advance(bytePoolReclaimInterval)
+		bufPool.Put(active[0])
+		active[0] = bufPool.Get()
+	}
+
+	if got := bufPool.NumPooled(); got > workingSet {
+		t.Fatalf("bytepool did not reclaim toward active working set while serving: got %v want <= %v", got, workingSet)
+	}
+	for _, b := range active {
+		bufPool.Put(b)
+	}
+}
+
+func TestBytePoolReclaimsTowardEmpty(t *testing.T) {
+	maxRetained := 4
+	width := 10
+	clock := newManualBytePoolClock()
+
+	bufPool := newBytePoolWithClock(maxRetained, func() interface{} {
+		return make([]byte, width)
+	}, clock.Now)
+
+	burst := make([][]byte, 0, maxRetained)
+	for i := 0; i < maxRetained; i++ {
+		burst = append(burst, bufPool.Get())
+	}
+	for _, b := range burst {
+		bufPool.Put(b)
+	}
+	if got := bufPool.NumPooled(); got != maxRetained {
+		t.Fatalf("bytepool burst retained size invalid: got %v want %v", got, maxRetained)
+	}
+
+	for i := 0; i < maxRetained; i++ {
+		b := bufPool.Get()
+		clock.Advance(bytePoolReclaimInterval)
+		bufPool.Put(b)
+	}
+	if got := bufPool.NumPooled(); got != 0 {
+		t.Fatalf("bytepool did not reclaim toward empty: got %v want %v", got, 0)
 	}
 }
 
@@ -67,14 +155,11 @@ func TestBytePoolRequestHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The last FreeBuffer happens after returning OK for the
-	// read, so thread scheduling may cause it to happen after we
-	// check.  Unmount to be sure we have finished all the work.
+	// The last FreeBuffer happens after returning OK for the read, so thread
+	// scheduling may cause it to occur after the count check. Unmount to be sure
+	// all work has finished.
 	srv.Unmount()
-	count := srv.readPool.NumPooled()
-	if count == 0 {
-		t.Errorf("expected %d buffers, got %d", 1, count)
+	if count := srv.readPool.NumPooled(); count > readPoolMaxRetainedBuffers {
+		t.Errorf("readPool retained too many buffers: got %d want <= %d", count, readPoolMaxRetainedBuffers)
 	}
-
-	// TODO: test write as well?
 }

@@ -234,7 +234,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			},
 		}
 	}
-	ms.readPool = newBytePool(maxReaders*2, func() interface{} {
+	ms.readPool = newBytePool(readPoolMaxRetainedBuffers, func() interface{} {
 		targetSize := o.MaxWrite + int(maxInputSize)
 		if targetSize < _FUSE_MIN_READ_BUFFER {
 			targetSize = _FUSE_MIN_READ_BUFFER
