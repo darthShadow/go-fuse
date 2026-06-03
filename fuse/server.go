@@ -45,8 +45,22 @@ type Server struct {
 	// Empty if unmounted.
 	mountPoint string
 
-	// writeMu serializes close and notify writes
-	writeMu sync.Mutex
+	// writeMu coordinates exclusive lifecycle operations on mountFd
+	// against concurrent notify writes:
+	//   - Close (in Serve) takes Lock so that mountFd is not closed
+	//     while a notify write or a passthrough ioctl is in flight.
+	//   - RegisterBackingFd / UnregisterBackingFd in passthrough_linux.go
+	//     take Lock so their SYS_IOCTL on mountFd is excluded from a
+	//     concurrent close and from the read-side of this lock used by
+	//     notify writes.
+	//   - Server.writev (used only by notify writes) takes RLock so
+	//     multiple notify writev's may proceed in parallel; each writev
+	//     is one atomic /dev/fuse packet, so notify-vs-notify needs no
+	//     userspace serialization.
+	// Regular handler replies do not go through Server.writev and do not
+	// hold this lock; shutdown safety for those depends on ms.loops.Wait
+	// before close.
+	writeMu sync.RWMutex
 
 	// I/O with kernel and daemon.
 	mountFd int
@@ -716,9 +730,11 @@ func notifyWrite(writev func([][]byte) (int, syscall.Errno), opts *MountOptions,
 }
 
 func (ms *Server) writev(iov [][]byte) (int, syscall.Errno) {
-	// Protect against concurrent close.
-	ms.writeMu.Lock()
-	defer ms.writeMu.Unlock()
+	// Protect against concurrent close. RLock allows multiple notify
+	// writev's to proceed in parallel (each writev is atomic at the
+	// /dev/fuse boundary).
+	ms.writeMu.RLock()
+	defer ms.writeMu.RUnlock()
 	n, err := writev(ms.mountFd, iov)
 
 	var errno syscall.Errno
