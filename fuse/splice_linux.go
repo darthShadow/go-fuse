@@ -31,6 +31,12 @@ func (ms *Server) setSplice() {
 // would carry the wrong total length, so we return an error and let the
 // caller fall back to a Pread-based path.
 func (ms *Server) trySplice(req *request, readResult ReadResult) error {
+	if _, ok := readResult.(seekableResult); !ok {
+		if _, ok := readResult.(statefulResult); !ok {
+			return errRecoverSplice
+		}
+	}
+
 	// The caller (handleRequest) already called req.serializeHeader with
 	// readResult.Size(), so req.outHeaderBuf is correct for the optimistic case.
 	total := len(req.outHeaderBuf) + len(req.outDataBuf) + readResult.Size()
@@ -94,8 +100,14 @@ func (ms *Server) trySplice(req *request, readResult ReadResult) error {
 	}
 
 	// Write header + payload to /dev/fuse.
-	_, err = pair.WriteTo(uintptr(ms.mountFd), total)
-	return err
+	wrote, err := pair.WriteTo(uintptr(ms.mountFd), total)
+	if err != nil {
+		return err
+	}
+	if wrote != total {
+		return fmt.Errorf("short splice write to /dev/fuse: wrote %d, want %d", wrote, total)
+	}
+	return nil
 }
 
 type pipeReadResult struct {
