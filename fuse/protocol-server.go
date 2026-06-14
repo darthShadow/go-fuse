@@ -19,8 +19,6 @@ type protocolServer struct {
 	reqInflight    []*request
 	connectionDead bool
 
-	latencies LatencyMap
-
 	kernelSettings InitIn
 
 	opts *MountOptions

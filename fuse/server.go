@@ -89,16 +89,13 @@ func (ms *Server) KernelSettings() *InitIn {
 
 const _MAX_NAME_LEN = 20
 
-// This type may be provided for recording latencies of each FUSE
-// operation.
+// This type is deprecated.
 type LatencyMap interface {
 	Add(name string, dt time.Duration)
 }
 
-// RecordLatencies switches on collection of timing for each request
-// coming from the kernel.P assing a nil argument switches off the
+// RecordLatencies is deprecated. It is provided for backward compatibility but does not do anything.
 func (ms *Server) RecordLatencies(l LatencyMap) {
-	ms.latencies = l
 }
 
 // Unmount calls fusermount -u on the mount. This has the effect of
@@ -372,14 +369,6 @@ func handleEINTR(fn func() error) (err error) {
 		}
 	}
 	return
-}
-
-func (ms *Server) recordStats(req *request) {
-	if ms.latencies != nil {
-		dt := time.Now().Sub(req.startTime)
-		opname := operationName(req.inHeader().Opcode)
-		ms.latencies.Add(opname, dt)
-	}
 }
 
 // Serve initiates the FUSE loop. Normally, callers should run Serve()

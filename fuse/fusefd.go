@@ -8,7 +8,6 @@ import (
 	"log"
 	"sync"
 	"syscall"
-	"time"
 	"unsafe"
 )
 
@@ -95,9 +94,6 @@ func (r *fuseFD) readRequest() (req *requestAlloc, code Status) {
 		return nil, ToStatus(err)
 	}
 
-	if ms.latencies != nil {
-		req.startTime = time.Now()
-	}
 	r.reqMu.Lock()
 	defer r.reqMu.Unlock()
 	gobbled := req.setInput(dest[:n])
@@ -129,8 +125,6 @@ func (r *fuseFD) readRequest() (req *requestAlloc, code Status) {
 
 // returnRequest returns a request to the pool of unused requests.
 func (r *fuseFD) returnRequest(req *requestAlloc) {
-	r.server.recordStats(&req.request)
-
 	if req.bufferPoolOutputBuf != nil {
 		r.buffers.FreeBuffer(req.bufferPoolOutputBuf)
 		req.bufferPoolOutputBuf = nil
