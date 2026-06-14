@@ -38,6 +38,42 @@ const (
 	maxMaxReaders = 16
 )
 
+// fuseFD owns the per-FUSE-fd state: the fd itself, the read-side
+// bookkeeping (reqReaders, inflightRequestBytes), the write serialization
+// mutex, and the WaitGroup tracking reader goroutines on this fd. The
+// pools are shared with the owning Server via pointers, and a back
+// pointer to the Server gives the per-fd methods access to shared
+// configuration and callbacks.
+//
+// Today a Server has a single fuseFD; this struct exists so that adding
+// support for FUSE_DEV_IOC_CLONE'd fds is a matter of widening the field
+// to a slice.
+type fuseFD struct {
+	server *Server
+
+	// I/O with kernel and daemon.
+	fd int
+
+	// writeMu serializes close and notify writes on fd.
+	writeMu sync.Mutex
+
+	reqMu                sync.Mutex
+	reqReaders           int
+	inflightRequestBytes int
+
+	// loops tracks reader goroutines servicing fd.
+	loops sync.WaitGroup
+
+	// Shared pools owned by Server.
+	reqPool  *sync.Pool
+	readPool *sync.Pool
+	buffers  *bufferPool
+
+	// Accounting constants, set once at server construction.
+	reqAllocBytes int
+	readBufBytes  int
+}
+
 // Server contains the logic for reading from the FUSE device.
 type Server struct {
 	protocolServer
@@ -45,11 +81,7 @@ type Server struct {
 	// Empty if unmounted.
 	mountPoint string
 
-	// writeMu serializes close and notify writes
-	writeMu sync.Mutex
-
-	// I/O with kernel and daemon.
-	mountFd int
+	fuseFD *fuseFD
 
 	opts *MountOptions
 
@@ -61,21 +93,12 @@ type Server struct {
 
 	// Pool for request structs.
 	reqPool sync.Pool
-	// reqAllocBytes is constant after NewServer, so it can be used for accounting.
-	reqAllocBytes int
 
 	// Pool for raw requests data
 	readPool sync.Pool
-	// readBufBytes is constant after NewServer, so it can be used for accounting.
-	readBufBytes         int
-	inflightRequestBytes int
-
-	reqMu      sync.Mutex
-	reqReaders int
 
 	singleReader bool
 	canSplice    bool
-	loops        sync.WaitGroup
 	serving      bool // for preventing duplicate Serve() calls
 
 	// Used to implement WaitMount on macos.
@@ -148,7 +171,7 @@ func (ms *Server) Unmount() (err error) {
 		return
 	}
 	// Wait for event loops to exit.
-	ms.loops.Wait()
+	ms.fuseFD.loops.Wait()
 	ms.mountPoint = ""
 	return err
 }
@@ -240,7 +263,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		maxReaders = maxMaxReaders
 	}
 
-	readBufSize, readBufBytes, reqAllocBytes := requestAccountingSizes(o.MaxWrite)
+	readBufSize, readBufBytes, _ := requestAccountingSizes(o.MaxWrite)
 
 	ms := &Server{
 		protocolServer: protocolServer{
@@ -248,15 +271,11 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			retrieveTab: make(map[uint64]*retrieveCacheRequest),
 			opts:        &o,
 		},
-		opts:          &o,
-		maxReaders:    maxReaders,
-		reqAllocBytes: reqAllocBytes,
-		readBufBytes:  readBufBytes,
-		singleReader:  useSingleReader,
-		ready:         make(chan error, 1),
+		opts:         &o,
+		maxReaders:   maxReaders,
+		singleReader: useSingleReader,
+		ready:        make(chan error, 1),
 	}
-
-	ms.protocolServer.writev = ms.writev
 	ms.reqPool.New = func() interface{} {
 		return &requestAlloc{
 			request: request{
@@ -287,18 +306,35 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 	}
 
 	ms.mountPoint = mountPoint
-	ms.mountFd = fd
+	ms.fuseFD = ms.newFuseFD(fd)
+	ms.protocolServer.writev = ms.fuseFD.writev
 
 	if code := ms.handleInit(); !code.Ok() {
-		syscall.Close(fd)
+		ms.fuseFD.close()
 		// TODO - unmount as well?
 		return nil, fmt.Errorf("init: %s", code)
 	}
 
 	// This prepares for Serve being called somewhere, either
 	// synchronously or asynchronously.
-	ms.loops.Add(1)
+	ms.fuseFD.loops.Add(1)
 	return ms, nil
+}
+
+// newFuseFD returns an fuseFD bound to ms and ready to read from fd.
+// All shared state (pools, buffer pool, accounting constants) is wired up
+// here.
+func (ms *Server) newFuseFD(fd int) *fuseFD {
+	_, readBufBytes, reqAllocBytes := requestAccountingSizes(ms.opts.MaxWrite)
+	return &fuseFD{
+		server:        ms,
+		fd:            fd,
+		reqPool:       &ms.reqPool,
+		readPool:      &ms.readPool,
+		buffers:       &ms.buffers,
+		reqAllocBytes: reqAllocBytes,
+		readBufBytes:  readBufBytes,
+	}
 }
 
 func requestAccountingSizes(maxWrite int) (readBufSize, readBufBytes, reqAllocBytes int) {
@@ -364,9 +400,9 @@ func (o *MountOptions) containsOption(opt string) bool {
 // purposes.
 func (ms *Server) DebugData() string {
 	var r int
-	ms.reqMu.Lock()
-	r = ms.reqReaders
-	ms.reqMu.Unlock()
+	ms.fuseFD.reqMu.Lock()
+	r = ms.fuseFD.reqReaders
+	ms.fuseFD.reqMu.Unlock()
 
 	return fmt.Sprintf("readers: %d", r)
 }
@@ -392,44 +428,48 @@ func handleEINTR(fn func() error) (err error) {
 
 // Returns a new request, or error. Returns
 // nil, OK if we have too many readers or request bytes already.
-func (ms *Server) readRequest() (req *requestAlloc, code Status) {
-	ms.reqMu.Lock()
-	if ms.reqReaders > ms.maxReaders || !ms.reserveRequestBytes() {
-		ms.reqMu.Unlock()
+// readRequest reads one request from the kernel. Returns nil, OK if
+// there are too many concurrent readers or insufficient request-bytes
+// budget.
+func (r *fuseFD) readRequest() (req *requestAlloc, code Status) {
+	ms := r.server
+	r.reqMu.Lock()
+	if r.reqReaders > ms.maxReaders || !r.reserveRequestBytes() {
+		r.reqMu.Unlock()
 		return nil, OK
 	}
-	ms.reqReaders++
-	ms.reqMu.Unlock()
+	r.reqReaders++
+	r.reqMu.Unlock()
 
-	req = ms.reqPool.Get().(*requestAlloc)
-	dest := ms.readPool.Get().([]byte)
+	req = r.reqPool.Get().(*requestAlloc)
+	dest := r.readPool.Get().([]byte)
 
 	var n int
 	err := handleEINTR(func() error {
 		var err error
-		n, err = syscall.Read(ms.mountFd, dest)
+		n, err = syscall.Read(r.fd, dest)
 		return err
 	})
 	if err != nil {
-		ms.reqMu.Lock()
-		ms.putReadBuf(dest)
-		ms.putReq(req)
-		ms.reqReaders--
-		ms.reqMu.Unlock()
+		r.reqMu.Lock()
+		r.putReadBuf(dest)
+		r.putReq(req)
+		r.reqReaders--
+		r.reqMu.Unlock()
 		return nil, ToStatus(err)
 	}
 
 	if ms.latencies != nil {
 		req.startTime = time.Now()
 	}
-	ms.reqMu.Lock()
-	defer ms.reqMu.Unlock()
+	r.reqMu.Lock()
+	defer r.reqMu.Unlock()
 	gobbled := req.setInput(dest[:n])
 	if len(req.inputBuf) < int(unsafe.Sizeof(InHeader{})) {
 		log.Printf("Short read for input header: %v", req.inputBuf)
-		ms.putReadBuf(dest)
-		ms.putReq(req)
-		ms.reqReaders--
+		r.putReadBuf(dest)
+		r.putReq(req)
+		r.reqReaders--
 		return nil, EINVAL
 	}
 	opCode := ((*InHeader)(unsafe.Pointer(&req.inputBuf[0]))).Opcode
@@ -440,50 +480,23 @@ func (ms *Server) readRequest() (req *requestAlloc, code Status) {
 	needsBackPressure := (opCode == _OP_FORGET || opCode == _OP_BATCH_FORGET)
 
 	if !gobbled {
-		ms.putReadBuf(dest)
+		r.putReadBuf(dest)
 	}
-	ms.reqReaders--
-	if !ms.singleReader && ms.reqReaders <= 0 && !needsBackPressure {
-		ms.loops.Add(1)
+	r.reqReaders--
+	if !ms.singleReader && r.reqReaders <= 0 && !needsBackPressure {
+		r.loops.Add(1)
 		go ms.loop()
 	}
 
 	return req, OK
 }
 
-func (ms *Server) reserveRequestBytes() bool {
-	if !ms.canReserveRequestBytes() {
-		return false
-	}
-	ms.inflightRequestBytes += ms.requestBytes()
-	return true
-}
-
-func (ms *Server) canReserveRequestBytes() bool {
-	return ms.inflightRequestBytes == 0 ||
-		ms.requestBytes() <= ms.opts.MaxInflightRequestBytes-ms.inflightRequestBytes
-}
-
-func (ms *Server) requestBytes() int {
-	return ms.reqAllocBytes + ms.readBufBytes
-}
-
-func (ms *Server) putReadBuf(buf []byte) {
-	ms.readPool.Put(buf)
-	ms.inflightRequestBytes -= ms.readBufBytes
-}
-
-func (ms *Server) putReq(req *requestAlloc) {
-	ms.reqPool.Put(req)
-	ms.inflightRequestBytes -= ms.reqAllocBytes
-}
-
 // returnRequest returns a request to the pool of unused requests.
-func (ms *Server) returnRequest(req *requestAlloc) {
-	ms.recordStats(&req.request)
+func (r *fuseFD) returnRequest(req *requestAlloc) {
+	r.server.recordStats(&req.request)
 
 	if req.bufferPoolOutputBuf != nil {
-		ms.buffers.FreeBuffer(req.bufferPoolOutputBuf)
+		r.buffers.FreeBuffer(req.bufferPoolOutputBuf)
 		req.bufferPoolOutputBuf = nil
 	}
 	if req.interrupted {
@@ -492,13 +505,55 @@ func (ms *Server) returnRequest(req *requestAlloc) {
 	}
 	req.clear()
 
-	ms.reqMu.Lock()
+	r.reqMu.Lock()
 	if p := req.bufferPoolInputBuf; p != nil {
 		req.bufferPoolInputBuf = nil
-		ms.putReadBuf(p)
+		r.putReadBuf(p)
 	}
-	ms.putReq(req)
-	ms.reqMu.Unlock()
+	r.putReq(req)
+	r.reqMu.Unlock()
+}
+
+func (r *fuseFD) reserveRequestBytes() bool {
+	if !r.canReserveRequestBytes() {
+		return false
+	}
+	r.inflightRequestBytes += r.requestBytes()
+	return true
+}
+
+func (r *fuseFD) canReserveRequestBytes() bool {
+	return r.inflightRequestBytes == 0 ||
+		r.requestBytes() <= r.server.opts.MaxInflightRequestBytes-r.inflightRequestBytes
+}
+
+// canAcceptAnother wraps canReserveRequestBytes with reqMu, for callers
+// that don't already hold the lock.
+func (r *fuseFD) canAcceptAnother() bool {
+	r.reqMu.Lock()
+	defer r.reqMu.Unlock()
+	return r.canReserveRequestBytes()
+}
+
+func (r *fuseFD) requestBytes() int {
+	return r.reqAllocBytes + r.readBufBytes
+}
+
+func (r *fuseFD) putReadBuf(buf []byte) {
+	r.readPool.Put(buf)
+	r.inflightRequestBytes -= r.readBufBytes
+}
+
+func (r *fuseFD) putReq(req *requestAlloc) {
+	r.reqPool.Put(req)
+	r.inflightRequestBytes -= r.reqAllocBytes
+}
+
+// close closes the underlying FUSE fd. Serialized with writers via writeMu.
+func (r *fuseFD) close() error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	return syscall.Close(r.fd)
 }
 
 func (ms *Server) recordStats(req *request) {
@@ -524,11 +579,9 @@ func (ms *Server) Serve() {
 	ms.serving = true
 
 	ms.loop()
-	ms.loops.Wait()
+	ms.fuseFD.loops.Wait()
 
-	ms.writeMu.Lock()
-	syscall.Close(ms.mountFd)
-	ms.writeMu.Unlock()
+	ms.fuseFD.close()
 
 	// shutdown in-flight cache retrieves.
 	//
@@ -553,7 +606,7 @@ func (ms *Server) Serve() {
 // Wait waits for the serve loop to exit. This should only be called
 // after Serve has been called, or it will hang indefinitely.
 func (ms *Server) Wait() {
-	ms.loops.Wait()
+	ms.fuseFD.loops.Wait()
 }
 
 func (ms *Server) handleInit() Status {
@@ -561,7 +614,7 @@ func (ms *Server) handleInit() Status {
 	// and don't spawn new readers.
 	orig := ms.singleReader
 	ms.singleReader = true
-	req, errNo := ms.readRequest()
+	req, errNo := ms.fuseFD.readRequest()
 	ms.singleReader = orig
 
 	if errNo != OK || req == nil {
@@ -609,10 +662,10 @@ func (ms *Server) handleInit() Status {
 // BenchmarkGoFuseReaddir         	    4074	    361568 ns/op
 // BenchmarkGoFuseReaddir-2       	    3511	    319765 ns/op
 func (ms *Server) loop() {
-	defer ms.loops.Done()
+	defer ms.fuseFD.loops.Done()
 exit:
 	for {
-		req, errNo := ms.readRequest()
+		req, errNo := ms.fuseFD.readRequest()
 		switch errNo {
 		case OK:
 			if req == nil {
@@ -634,21 +687,16 @@ exit:
 			break exit
 		}
 
-		if ms.singleReader {
-			ms.reqMu.Lock()
-			canReserve := ms.canReserveRequestBytes()
-			ms.reqMu.Unlock()
-			if canReserve {
-				go ms.handleRequest(req)
-				continue
-			}
+		if ms.singleReader && ms.fuseFD.canAcceptAnother() {
+			go ms.handleRequest(req)
+			continue
 		}
 		ms.handleRequest(req)
 	}
 }
 
 func (ms *Server) handleRequest(req *requestAlloc) Status {
-	defer ms.returnRequest(req)
+	defer ms.fuseFD.returnRequest(req)
 	if ms.opts.SingleThreaded {
 		ms.requestProcessingMu.Lock()
 		defer ms.requestProcessingMu.Unlock()
@@ -675,7 +723,7 @@ func (ms *Server) handleRequest(req *requestAlloc) Status {
 	if req.suppressReply {
 		return OK
 	}
-	errno := ms.write(&req.request)
+	errno := ms.fuseFD.write(&req.request)
 	if errno != 0 {
 		// Ignore ENOENT for INTERRUPT responses which
 		// indicates that the referred request is no longer
@@ -715,11 +763,11 @@ func notifyWrite(writev func([][]byte) (int, syscall.Errno), opts *MountOptions,
 	return Status(errno)
 }
 
-func (ms *Server) writev(iov [][]byte) (int, syscall.Errno) {
+func (r *fuseFD) writev(iov [][]byte) (int, syscall.Errno) {
 	// Protect against concurrent close.
-	ms.writeMu.Lock()
-	defer ms.writeMu.Unlock()
-	n, err := writev(ms.mountFd, iov)
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	n, err := writev(r.fd, iov)
 
 	var errno syscall.Errno
 	if err != nil {

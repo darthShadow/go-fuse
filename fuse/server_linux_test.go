@@ -272,9 +272,9 @@ func waitForReader(t *testing.T, srv *Server) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		srv.reqMu.Lock()
-		readers := srv.reqReaders
-		srv.reqMu.Unlock()
+		srv.fuseFD.reqMu.Lock()
+		readers := srv.fuseFD.reqReaders
+		srv.fuseFD.reqMu.Unlock()
 		if readers > 0 {
 			return
 		}
