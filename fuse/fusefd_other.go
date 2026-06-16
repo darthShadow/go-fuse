@@ -2,15 +2,22 @@
 
 package fuse
 
+import "syscall"
+
 // OSX and FreeBSD has races when multiple routines read
 // from the FUSE device: on unmount, sometime some reads
 // do not error-out, meaning that unmount will hang.
 const useSingleReader = true
 
-func (ms *Server) write(req *request) Status {
+// cloneFuseFD is not supported outside Linux.
+func cloneFuseFD(src int) (int, error) {
+	return -1, syscall.ENOSYS
+}
+
+func (r *fuseFD) write(req *request) Status {
 	if req.outPayloadSize() == 0 {
 		err := handleEINTR(func() error {
-			_, err := writev(int(ms.mountFd), [][]byte{req.outHeaderBuf, req.outDataBuf})
+			_, err := writev(int(r.fd), [][]byte{req.outHeaderBuf, req.outDataBuf})
 			return err
 		})
 		return ToStatus(err)
@@ -23,7 +30,7 @@ func (ms *Server) write(req *request) Status {
 		req.readResult = nil
 	}
 
-	_, err := writev(int(ms.mountFd), [][]byte{req.outHeaderBuf, req.outDataBuf, req.outPayload})
+	_, err := writev(int(r.fd), [][]byte{req.outHeaderBuf, req.outDataBuf, req.outPayload})
 	if req.readResult != nil {
 		req.readResult.Done()
 	}

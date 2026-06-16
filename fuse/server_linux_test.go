@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/hanwen/go-fuse/v2/internal/testutil"
 )
 
 type blockingWriteFS struct {
@@ -272,13 +274,107 @@ func waitForReader(t *testing.T, srv *Server) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		srv.reqMu.Lock()
-		readers := srv.reqReaders
-		srv.reqMu.Unlock()
+		var readers int
+		for _, fd := range srv.fuseFDs {
+			fd.reqMu.Lock()
+			readers += fd.reqReaders
+			fd.reqMu.Unlock()
+		}
 		if readers > 0 {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("timed out waiting for a request reader")
+}
+
+// minimalFS supports just enough operations to mount and stat the root.
+type minimalFS struct{ defaultRawFileSystem }
+
+func (*minimalFS) GetAttr(cancel <-chan struct{}, in *GetAttrIn, out *AttrOut) Status {
+	out.Attr = Attr{Ino: 1, Mode: S_IFDIR | 0755, Nlink: 2}
+	return OK
+}
+
+// TestNumCloneFDs verifies that NumCloneFDs opens additional /dev/fuse
+// fds bound to the same session, that the server still serves requests,
+// and that mount/unmount complete cleanly.
+func TestNumCloneFDs(t *testing.T) {
+	const want = 3
+	mnt := t.TempDir()
+	srv, err := NewServer(&minimalFS{}, mnt, &MountOptions{
+		NumCloneFDs: want - 1,
+		Debug:       testutil.VerboseTest(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotFDs := len(srv.fuseFDs)
+
+	go srv.Serve()
+	if err := srv.WaitMount(); err != nil {
+		t.Fatal(err)
+	}
+
+	if gotFDs < want {
+		if err := srv.Unmount(); err != nil {
+			t.Fatalf("Unmount: %v", err)
+		}
+		t.Skipf("kernel lacks FUSE_DEV_IOC_CLONE support: len(fuseFDs) = %d, want %d", gotFDs, want)
+	}
+	if got := gotFDs; got != want {
+		t.Errorf("len(fuseFDs) = %d, want %d", got, want)
+	}
+	for i, fd := range srv.fuseFDs {
+		if fd.fd <= 0 {
+			t.Errorf("fuseFDs[%d].fd = %d, want > 0", i, fd.fd)
+		}
+	}
+
+	for i := 0; i < 64; i++ {
+		var st syscall.Stat_t
+		if err := syscall.Stat(mnt, &st); err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+	}
+
+	if err := srv.Unmount(); err != nil {
+		t.Fatalf("Unmount: %v", err)
+	}
+}
+
+func TestNumCloneFDsGracefulDegrade(t *testing.T) {
+	oldCloneFuseFDFn := cloneFuseFDFn
+	cloneFuseFDFn = func(int) (int, error) {
+		return -1, syscall.ENOSYS
+	}
+	t.Cleanup(func() {
+		cloneFuseFDFn = oldCloneFuseFDFn
+	})
+
+	mnt := t.TempDir()
+	srv, err := NewServer(&minimalFS{}, mnt, &MountOptions{
+		NumCloneFDs: 2,
+		Logger:      log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(srv.fuseFDs), 1; got != want {
+		t.Fatalf("len(fuseFDs) = %d, want %d", got, want)
+	}
+
+	go srv.Serve()
+	if err := srv.WaitMount(); err != nil {
+		t.Fatal(err)
+	}
+
+	var st syscall.Stat_t
+	if err := syscall.Stat(mnt, &st); err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	if err := srv.Unmount(); err != nil {
+		t.Fatalf("Unmount: %v", err)
+	}
 }

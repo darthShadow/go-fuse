@@ -38,6 +38,8 @@ const (
 	maxMaxReaders = 16
 )
 
+var cloneFuseFDFn = cloneFuseFD
+
 // Server contains the logic for reading from the FUSE device.
 type Server struct {
 	protocolServer
@@ -45,25 +47,14 @@ type Server struct {
 	// Empty if unmounted.
 	mountPoint string
 
-	// writeMu coordinates exclusive lifecycle operations on mountFd
-	// against concurrent notify writes:
-	//   - Close (in Serve) takes Lock so that mountFd is not closed
-	//     while a notify write or a passthrough ioctl is in flight.
-	//   - RegisterBackingFd / UnregisterBackingFd in passthrough_linux.go
-	//     take Lock so their SYS_IOCTL on mountFd is excluded from a
-	//     concurrent close and from the read-side of this lock used by
-	//     notify writes.
-	//   - Server.writev (used only by notify writes) takes RLock so
-	//     multiple notify writev's may proceed in parallel; each writev
-	//     is one atomic /dev/fuse packet, so notify-vs-notify needs no
-	//     userspace serialization.
-	// Regular handler replies do not go through Server.writev and do not
-	// hold this lock; shutdown safety for those depends on ms.loops.Wait
-	// before close.
-	writeMu sync.RWMutex
-
-	// I/O with kernel and daemon.
-	mountFd int
+	// fuseFDs[0] is the original /dev/fuse fd from mount(2).
+	// fuseFDs[1:] are FUSE_DEV_IOC_CLONE'd siblings (opt-in via
+	// MountOptions.NumCloneFDs). Each fd has an independent kernel queue
+	// serviced by its own reader-goroutine tree. Per-fd lifecycle and
+	// write coordination (writeMu), read accounting (reqReaders,
+	// inflightRequestBytes), and the reader WaitGroup (loops) live on
+	// fuseFD; see fusefd.go.
+	fuseFDs []*fuseFD
 
 	opts *MountOptions
 
@@ -73,23 +64,15 @@ type Server struct {
 	// Pools for []byte
 	buffers bufferPool
 
-	// Pool for request structs.
+	// Pool for request structs. Shared by all fuseFDs via pointer.
 	reqPool sync.Pool
-	// reqAllocBytes is constant after NewServer, so it can be used for accounting.
-	reqAllocBytes int
 
-	// Pool for raw requests data
+	// Pool for raw requests data. Shared by all fuseFDs via pointer;
+	// per-fd accounting lives on fuseFD.
 	readPool bytePool
-	// readBufBytes is constant after NewServer, so it can be used for accounting.
-	readBufBytes         int
-	inflightRequestBytes int
-
-	reqMu      sync.Mutex
-	reqReaders int
 
 	singleReader bool
 	canSplice    bool
-	loops        sync.WaitGroup
 	serving      bool // for preventing duplicate Serve() calls
 
 	// Used to implement WaitMount on macos.
@@ -162,9 +145,16 @@ func (ms *Server) Unmount() (err error) {
 		return
 	}
 	// Wait for event loops to exit.
-	ms.loops.Wait()
+	ms.waitLoops()
 	ms.mountPoint = ""
 	return err
+}
+
+// waitLoops blocks until every fuseFD's reader tree has drained.
+func (ms *Server) waitLoops() {
+	for _, fd := range ms.fuseFDs {
+		fd.loops.Wait()
+	}
 }
 
 // alignSlice ensures that the byte at alignedByte is aligned with the
@@ -254,7 +244,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		maxReaders = maxMaxReaders
 	}
 
-	readBufSize, readBufBytes, reqAllocBytes := requestAccountingSizes(o.MaxWrite)
+	readBufSize, readBufBytes, _ := requestAccountingSizes(o.MaxWrite)
 
 	ms := &Server{
 		protocolServer: protocolServer{
@@ -262,15 +252,12 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			retrieveTab: make(map[uint64]*retrieveCacheRequest),
 			opts:        &o,
 		},
-		opts:          &o,
-		maxReaders:    maxReaders,
-		reqAllocBytes: reqAllocBytes,
-		readBufBytes:  readBufBytes,
-		singleReader:  useSingleReader,
-		ready:         make(chan error, 1),
+		opts:         &o,
+		maxReaders:   maxReaders,
+		singleReader: useSingleReader,
+		ready:        make(chan error, 1),
 	}
 
-	ms.protocolServer.writev = ms.writev
 	ms.reqPool.New = func() interface{} {
 		return &requestAlloc{
 			request: request{
@@ -299,17 +286,39 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 	}
 
 	ms.mountPoint = mountPoint
-	ms.mountFd = fd
+	ms.fuseFDs = []*fuseFD{ms.newFuseFD(fd)}
+	// Notifications and session-level kernel ops target the primary fd;
+	// reply writes go via the originating fuseFD threaded through
+	// handleRequest.
+	ms.protocolServer.writev = ms.fuseFDs[0].writev
 
 	if code := ms.handleInit(); !code.Ok() {
-		syscall.Close(fd)
+		ms.fuseFDs[0].close()
 		// TODO - unmount as well?
 		return nil, fmt.Errorf("init: %s", code)
 	}
 
+	// INIT has run on the primary fd. Now open the cloned fds: each
+	// binds to the same session but has its own kernel queue. Degrade
+	// gracefully on failure (the primary fd alone still serves requests).
+	for i := 0; i < o.NumCloneFDs; i++ {
+		cloned, err := cloneFuseFDFn(fd)
+		if err != nil {
+			o.Logger.Printf("FUSE_DEV_IOC_CLONE failed at clone %d/%d: %v; continuing with %d fd(s)", i+1, o.NumCloneFDs, err, len(ms.fuseFDs))
+			break
+		}
+		ms.fuseFDs = append(ms.fuseFDs, ms.newFuseFD(cloned))
+	}
+	if o.NumCloneFDs > 0 && o.MaxInflightRequestBytes != math.MaxInt {
+		effectiveCeiling := len(ms.fuseFDs) * o.MaxInflightRequestBytes
+		o.Logger.Printf("MaxInflightRequestBytes is enforced per fd: NumCloneFDs=%d, active fds=%d, per-fd ceiling=%d bytes, effective ceiling=%d bytes", o.NumCloneFDs, len(ms.fuseFDs), o.MaxInflightRequestBytes, effectiveCeiling)
+	}
+
 	// This prepares for Serve being called somewhere, either
-	// synchronously or asynchronously.
-	ms.loops.Add(1)
+	// synchronously or asynchronously. One base reader per fuseFD.
+	for _, ff := range ms.fuseFDs {
+		ff.loops.Add(1)
+	}
 	return ms, nil
 }
 
@@ -375,12 +384,13 @@ func (o *MountOptions) containsOption(opt string) bool {
 // DebugData returns internal status information for debugging
 // purposes.
 func (ms *Server) DebugData() string {
-	var r int
-	ms.reqMu.Lock()
-	r = ms.reqReaders
-	ms.reqMu.Unlock()
-
-	return fmt.Sprintf("readers: %d", r)
+	var total int
+	for _, fd := range ms.fuseFDs {
+		fd.reqMu.Lock()
+		total += fd.reqReaders
+		fd.reqMu.Unlock()
+	}
+	return fmt.Sprintf("readers: %d", total)
 }
 
 // handleEINTR retries the given function until it doesn't return syscall.EINTR.
@@ -400,119 +410,6 @@ func handleEINTR(fn func() error) (err error) {
 		}
 	}
 	return
-}
-
-// Returns a new request, or error. Returns
-// nil, OK if we have too many readers or request bytes already.
-func (ms *Server) readRequest() (req *requestAlloc, code Status) {
-	ms.reqMu.Lock()
-	if ms.reqReaders > ms.maxReaders || !ms.reserveRequestBytes() {
-		ms.reqMu.Unlock()
-		return nil, OK
-	}
-	ms.reqReaders++
-	ms.reqMu.Unlock()
-
-	req = ms.reqPool.Get().(*requestAlloc)
-	dest := ms.readPool.Get()
-
-	var n int
-	err := handleEINTR(func() error {
-		var err error
-		n, err = syscall.Read(ms.mountFd, dest)
-		return err
-	})
-	if err != nil {
-		ms.reqMu.Lock()
-		ms.putReadBuf(dest)
-		ms.putReq(req)
-		ms.reqReaders--
-		ms.reqMu.Unlock()
-		return nil, ToStatus(err)
-	}
-
-	if ms.latencies != nil {
-		req.startTime = time.Now()
-	}
-	ms.reqMu.Lock()
-	defer ms.reqMu.Unlock()
-	gobbled := req.setInput(dest[:n])
-	if len(req.inputBuf) < int(unsafe.Sizeof(InHeader{})) {
-		log.Printf("Short read for input header: %v", req.inputBuf)
-		ms.putReadBuf(dest)
-		ms.putReq(req)
-		ms.reqReaders--
-		return nil, EINVAL
-	}
-	opCode := ((*InHeader)(unsafe.Pointer(&req.inputBuf[0]))).Opcode
-	/* These messages don't expect reply, so they cost nothing for
-	   the kernel to send. Make sure we're not overwhelmed by not
-	   spawning a new reader.
-	*/
-	needsBackPressure := (opCode == _OP_FORGET || opCode == _OP_BATCH_FORGET)
-
-	if !gobbled {
-		ms.putReadBuf(dest)
-	}
-	ms.reqReaders--
-	if !ms.singleReader && ms.reqReaders <= 0 && !needsBackPressure {
-		ms.loops.Add(1)
-		go ms.loop()
-	}
-
-	return req, OK
-}
-
-func (ms *Server) reserveRequestBytes() bool {
-	if !ms.canReserveRequestBytes() {
-		return false
-	}
-	ms.inflightRequestBytes += ms.requestBytes()
-	return true
-}
-
-func (ms *Server) canReserveRequestBytes() bool {
-	return ms.inflightRequestBytes == 0 ||
-		ms.requestBytes() <= ms.opts.MaxInflightRequestBytes-ms.inflightRequestBytes
-}
-
-func (ms *Server) requestBytes() int {
-	return ms.reqAllocBytes + ms.readBufBytes
-}
-
-func (ms *Server) putReadBuf(buf []byte) {
-	ms.readPool.Put(buf)
-	ms.inflightRequestBytes -= ms.readBufBytes
-}
-
-func (ms *Server) putReq(req *requestAlloc) {
-	ms.reqPool.Put(req)
-	ms.inflightRequestBytes -= ms.reqAllocBytes
-}
-
-// returnRequest returns a request to the pool of unused requests.
-func (ms *Server) returnRequest(req *requestAlloc) {
-	ms.recordStats(&req.request)
-
-	if req.bufferPoolOutputBuf != nil {
-		ms.buffers.FreeBuffer(req.bufferPoolOutputBuf)
-		req.bufferPoolOutputBuf = nil
-	}
-
-	if req.interrupted {
-		req.interrupted = false
-		req.cancel = make(chan struct{}, 0)
-	}
-	p := req.bufferPoolInputBuf
-	req.bufferPoolInputBuf = nil
-	req.clear()
-
-	ms.reqMu.Lock()
-	if p != nil {
-		ms.putReadBuf(p)
-	}
-	ms.putReq(req)
-	ms.reqMu.Unlock()
 }
 
 func (ms *Server) recordStats(req *request) {
@@ -537,12 +434,17 @@ func (ms *Server) Serve() {
 	}
 	ms.serving = true
 
-	ms.loop()
-	ms.loops.Wait()
+	// One base reader per fuseFD. With cloned fds these run
+	// concurrently against independent kernel queues.
+	for i := 1; i < len(ms.fuseFDs); i++ {
+		go ms.loop(ms.fuseFDs[i])
+	}
+	ms.loop(ms.fuseFDs[0])
+	ms.waitLoops()
 
-	ms.writeMu.Lock()
-	syscall.Close(ms.mountFd)
-	ms.writeMu.Unlock()
+	for _, ff := range ms.fuseFDs {
+		ff.close()
+	}
 
 	// shutdown in-flight cache retrieves.
 	//
@@ -567,21 +469,23 @@ func (ms *Server) Serve() {
 // Wait waits for the serve loop to exit. This should only be called
 // after Serve has been called, or it will hang indefinitely.
 func (ms *Server) Wait() {
-	ms.loops.Wait()
+	ms.waitLoops()
 }
 
 func (ms *Server) handleInit() Status {
-	// The first request should be INIT; read it synchronously,
-	// and don't spawn new readers.
+	// The first request should be INIT; read it synchronously, and
+	// don't spawn new readers. INIT always arrives on the primary fd;
+	// cloned fds don't exist yet at this point.
+	primary := ms.fuseFDs[0]
 	orig := ms.singleReader
 	ms.singleReader = true
-	req, errNo := ms.readRequest()
+	req, errNo := primary.readRequest()
 	ms.singleReader = orig
 
 	if errNo != OK || req == nil {
 		return errNo
 	}
-	if code := ms.handleRequest(req); !code.Ok() {
+	if code := ms.handleRequest(primary, req); !code.Ok() {
 		return code
 	}
 
@@ -622,11 +526,11 @@ func (ms *Server) handleInit() Status {
 // BenchmarkGoFuseStat-2          	    9310	    121332 ns/op
 // BenchmarkGoFuseReaddir         	    4074	    361568 ns/op
 // BenchmarkGoFuseReaddir-2       	    3511	    319765 ns/op
-func (ms *Server) loop() {
-	defer ms.loops.Done()
+func (ms *Server) loop(fd *fuseFD) {
+	defer fd.loops.Done()
 exit:
 	for {
-		req, errNo := ms.readRequest()
+		req, errNo := fd.readRequest()
 		switch errNo {
 		case OK:
 			if req == nil {
@@ -648,21 +552,16 @@ exit:
 			break exit
 		}
 
-		if ms.singleReader {
-			ms.reqMu.Lock()
-			canReserve := ms.canReserveRequestBytes()
-			ms.reqMu.Unlock()
-			if canReserve {
-				go ms.handleRequest(req)
-				continue
-			}
+		if ms.singleReader && fd.canAcceptAnother() {
+			go ms.handleRequest(fd, req)
+			continue
 		}
-		ms.handleRequest(req)
+		ms.handleRequest(fd, req)
 	}
 }
 
-func (ms *Server) handleRequest(req *requestAlloc) Status {
-	defer ms.returnRequest(req)
+func (ms *Server) handleRequest(fd *fuseFD, req *requestAlloc) Status {
+	defer fd.returnRequest(req)
 	if ms.opts.SingleThreaded {
 		ms.requestProcessingMu.Lock()
 		defer ms.requestProcessingMu.Unlock()
@@ -689,7 +588,7 @@ func (ms *Server) handleRequest(req *requestAlloc) Status {
 	if req.suppressReply {
 		return OK
 	}
-	errno := ms.write(&req.request)
+	errno := fd.write(&req.request)
 	if errno != 0 {
 		// Ignore ENOENT for INTERRUPT responses which
 		// indicates that the referred request is no longer
@@ -727,26 +626,6 @@ func notifyWrite(writev func([][]byte) (int, syscall.Errno), opts *MountOptions,
 	}
 
 	return Status(errno)
-}
-
-func (ms *Server) writev(iov [][]byte) (int, syscall.Errno) {
-	// Protect against concurrent close. RLock allows multiple notify
-	// writev's to proceed in parallel (each writev is atomic at the
-	// /dev/fuse boundary).
-	ms.writeMu.RLock()
-	defer ms.writeMu.RUnlock()
-	n, err := writev(ms.mountFd, iov)
-
-	var errno syscall.Errno
-	if err != nil {
-		errno = err.(syscall.Errno)
-		if errno == syscall.EINVAL {
-			// Detail: the kernel returns EINVAL for unsupported
-			// notify methods.
-			errno = syscall.ENOSYS
-		}
-	}
-	return n, errno
 }
 
 func (ms *protocolServer) notifyWrite(req *request) Status {

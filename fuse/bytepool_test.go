@@ -164,13 +164,10 @@ func TestBytePoolRequestHandler(t *testing.T) {
 	}
 }
 
-func TestReturnRequestReleasesGobbledReadBuffer(t *testing.T) {
-	const maxWrite = 4096
-
-	_, readBufBytes, reqAllocBytes := requestAccountingSizes(maxWrite)
+func newTestFuseFD(maxWrite int) (*Server, *fuseFD) {
+	_, readBufBytes, _ := requestAccountingSizes(maxWrite)
 	srv := &Server{
-		reqAllocBytes: reqAllocBytes,
-		readBufBytes:  readBufBytes,
+		opts: &MountOptions{MaxWrite: maxWrite},
 	}
 	srv.reqPool.New = func() interface{} {
 		return &requestAlloc{
@@ -182,10 +179,17 @@ func TestReturnRequestReleasesGobbledReadBuffer(t *testing.T) {
 	srv.readPool = newBytePool(readPoolMaxRetainedBuffers, func() interface{} {
 		return make([]byte, readBufBytes)
 	})
+	fd := srv.newFuseFD(-1)
+	return srv, fd
+}
 
+func TestReturnRequestReleasesGobbledReadBuffer(t *testing.T) {
+	const maxWrite = 4096
+
+	srv, fd := newTestFuseFD(maxWrite)
 	req := srv.reqPool.Get().(*requestAlloc)
 	readBuf := srv.readPool.Get()
-	srv.inflightRequestBytes = srv.requestBytes()
+	fd.inflightRequestBytes = fd.requestBytes()
 
 	gobbled := req.setInput(readBuf[:cap(req.smallInputBuf)])
 	if !gobbled {
@@ -195,12 +199,53 @@ func TestReturnRequestReleasesGobbledReadBuffer(t *testing.T) {
 		t.Fatalf("readPool retained size before return invalid: got %d want %d", got, 0)
 	}
 
-	srv.returnRequest(req)
+	fd.returnRequest(req)
 
-	if got := srv.inflightRequestBytes; got != 0 {
+	if got := fd.inflightRequestBytes; got != 0 {
 		t.Fatalf("inflightRequestBytes after return invalid: got %d want %d", got, 0)
 	}
 	if got := srv.readPool.NumPooled(); got != 1 {
 		t.Fatalf("readPool retained size after gobbled request return invalid: got %d want %d", got, 1)
+	}
+}
+
+func TestFuseFDReserveRequestBytesAllowsSingleRequestBelowBudget(t *testing.T) {
+	const maxWrite = 4096
+
+	srv, fd := newTestFuseFD(maxWrite)
+	srv.opts.MaxInflightRequestBytes = 1
+
+	if ok := fd.reserveRequestBytes(); !ok {
+		t.Fatal("first reservation failed below request size budget")
+	}
+	if ok := fd.reserveRequestBytes(); ok {
+		t.Fatal("second reservation succeeded below request size budget")
+	}
+}
+
+func TestFuseFDReserveRequestBytesIsPerFD(t *testing.T) {
+	const maxWrite = 4096
+
+	srv, primary := newTestFuseFD(maxWrite)
+	requestBytes := primary.requestBytes()
+	srv.opts.MaxInflightRequestBytes = requestBytes
+	srv.fuseFDs = []*fuseFD{
+		primary,
+		srv.newFuseFD(-1),
+		srv.newFuseFD(-1),
+	}
+
+	total := 0
+	for i, fd := range srv.fuseFDs {
+		if ok := fd.reserveRequestBytes(); !ok {
+			t.Fatalf("reserveRequestBytes failed on fuseFD[%d]", i)
+		}
+		total += fd.inflightRequestBytes
+	}
+	if got, want := total, len(srv.fuseFDs)*requestBytes; got != want {
+		t.Fatalf("total inflightRequestBytes invalid: got %d want %d", got, want)
+	}
+	if ok := srv.fuseFDs[0].reserveRequestBytes(); ok {
+		t.Fatal("second reservation on one fd succeeded; want per-fd ceiling")
 	}
 }

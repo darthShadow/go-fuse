@@ -386,6 +386,26 @@ type MountOptions struct {
 	// ExtraCapabilities is a bitmask of capabilities which
 	// must be enabled in addition to the defaults.
 	ExtraCapabilities uint64
+
+	// NumCloneFDs opens this many additional /dev/fuse file
+	// descriptors and binds them to the mount session via
+	// FUSE_DEV_IOC_CLONE (Linux >= 4.2). Each cloned fd has its
+	// own kernel queue and is serviced by a dedicated reader
+	// goroutine tree, which removes the single-fd read
+	// contention that limits throughput on many-core machines.
+	// Notifications and session-level kernel ops (e.g.
+	// RegisterBackingFd) continue to use the primary fd.
+	//
+	// Replies are written back via the fd the request was read
+	// from, matching the kernel's per-fd queue affinity.
+	//
+	// On non-Linux, gracefully ignored after one failed clone
+	// attempt. Defaults to 0 (no cloning).
+	//
+	// Note: MaxInflightRequestBytes is enforced per fd, so the
+	// effective memory ceiling is (1+NumCloneFDs) *
+	// MaxInflightRequestBytes.
+	NumCloneFDs int
 }
 
 // RawFileSystem is an interface close to the FUSE wire protocol.
