@@ -6,17 +6,17 @@ package fuse
 
 import (
 	"log"
+	"os"
 	"sync"
 	"syscall"
 	"unsafe"
 )
 
 // fuseFD owns the per-FUSE-fd state: the fd itself, the read-side
-// bookkeeping (reqReaders, inflightRequestBytes), the write serialization
-// mutex, and the WaitGroup tracking reader goroutines on this fd. The
-// pools are shared with the owning Server via pointers, and a back
-// pointer to the Server gives the per-fd methods access to shared
-// configuration and callbacks.
+// bookkeeping (reqReaders, inflightRequestBytes), and the WaitGroup
+// tracking reader goroutines on this fd. The pools are shared with the
+// owning Server via pointers, and a back pointer to the Server gives the
+// per-fd methods access to shared configuration and callbacks.
 //
 // Today a Server has a single fuseFD; this struct exists so that adding
 // support for FUSE_DEV_IOC_CLONE'd fds is a matter of widening the field
@@ -24,11 +24,12 @@ import (
 type fuseFD struct {
 	server *Server
 
-	// I/O with kernel and daemon.
-	fd int
-
-	// writeMu serializes close and notify writes on fd.
-	writeMu sync.Mutex
+	// I/O with kernel and daemon. file owns the FUSE fd; conn is its
+	// RawConn. Running syscalls through conn holds a reference on the
+	// fd, so concurrent writers and close() are safe against the fd
+	// number being reused without any explicit locking.
+	file *os.File
+	conn syscall.RawConn
 
 	reqMu                sync.Mutex
 	reqReaders           int
@@ -48,19 +49,51 @@ type fuseFD struct {
 }
 
 // newFuseFD returns a fuseFD bound to ms and ready to read from fd.
-// All shared state (pools, buffer pool, accounting constants) is wired
-// up here.
-func (ms *Server) newFuseFD(fd int) *fuseFD {
+// Ownership of fd passes to the returned fuseFD's *os.File. All shared
+// state (pools, buffer pool, accounting constants) is wired up here.
+func (ms *Server) newFuseFD(fd int) (*fuseFD, error) {
+	file := os.NewFile(uintptr(fd), "/dev/fuse")
+	conn, err := file.SyscallConn()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
 	_, readBufBytes, reqAllocBytes := requestAccountingSizes(ms.opts.MaxWrite)
 	return &fuseFD{
 		server:        ms,
-		fd:            fd,
+		file:          file,
+		conn:          conn,
 		reqPool:       &ms.reqPool,
 		readPool:      &ms.readPool,
 		buffers:       &ms.buffers,
 		reqAllocBytes: reqAllocBytes,
 		readBufBytes:  readBufBytes,
+	}, nil
+}
+
+// withFD runs f with the underlying FUSE file descriptor, holding a
+// reference on it for the duration so the fd cannot be closed (and its
+// number reused) while f runs. This is what lets concurrent writers and
+// close() run without a serializing mutex. The error is non-nil only
+// when the fd is already closed, in which case f is not called.
+func (r *fuseFD) withFD(f func(fd int)) error {
+	return r.conn.Control(func(fd uintptr) {
+		f(int(fd))
+	})
+}
+
+// writevFD writes iov to the FUSE fd, holding a reference against
+// concurrent close. The error is the underlying syscall error, or a
+// non-syscall error if the fd is already closed.
+func (r *fuseFD) writevFD(iov [][]byte) (int, error) {
+	var n int
+	var err error
+	if cerr := r.withFD(func(fd int) {
+		n, err = writev(fd, iov)
+	}); cerr != nil {
+		return 0, cerr
 	}
+	return n, err
 }
 
 // readRequest reads one request from the kernel. Returns nil, OK if
@@ -82,7 +115,11 @@ func (r *fuseFD) readRequest() (req *requestAlloc, code Status) {
 	var n int
 	err := handleEINTR(func() error {
 		var err error
-		n, err = syscall.Read(r.fd, dest)
+		if cerr := r.withFD(func(fd int) {
+			n, err = syscall.Read(fd, dest)
+		}); cerr != nil {
+			return cerr
+		}
 		return err
 	})
 	if err != nil {
@@ -179,27 +216,26 @@ func (r *fuseFD) putReq(req *requestAlloc) {
 	r.inflightRequestBytes -= r.reqAllocBytes
 }
 
-// close closes the underlying FUSE fd. Serialized with writers via writeMu.
+// close closes the underlying FUSE fd. The *os.File waits for in-flight
+// RawConn operations (reads, writes, ioctls) before releasing the fd.
 func (r *fuseFD) close() error {
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-	return syscall.Close(r.fd)
+	return r.file.Close()
 }
 
 func (r *fuseFD) writev(iov [][]byte) (int, syscall.Errno) {
-	// Protect against concurrent close.
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-	n, err := writev(r.fd, iov)
-
-	var errno syscall.Errno
-	if err != nil {
-		errno = err.(syscall.Errno)
-		if errno == syscall.EINVAL {
-			// Detail: the kernel returns EINVAL for unsupported
-			// notify methods.
-			errno = syscall.ENOSYS
-		}
+	n, err := r.writevFD(iov)
+	if err == nil {
+		return n, 0
+	}
+	errno, ok := err.(syscall.Errno)
+	if !ok {
+		// The fd is closed; report it as such.
+		return n, syscall.EBADF
+	}
+	if errno == syscall.EINVAL {
+		// Detail: the kernel returns EINVAL for unsupported
+		// notify methods.
+		errno = syscall.ENOSYS
 	}
 	return n, errno
 }

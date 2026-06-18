@@ -9,7 +9,7 @@ const useSingleReader = false
 func (r *fuseFD) write(req *request) Status {
 	if req.outPayloadSize() == 0 {
 		err := handleEINTR(func() error {
-			_, err := writev(r.fd, [][]byte{req.outHeaderBuf, req.outDataBuf})
+			_, err := r.writevFD([][]byte{req.outHeaderBuf, req.outDataBuf})
 			return err
 		})
 		return ToStatus(err)
@@ -30,6 +30,6 @@ func (r *fuseFD) write(req *request) Status {
 		req.serializeHeader(len(req.outPayload))
 	}
 
-	_, err := writev(r.fd, [][]byte{req.outHeaderBuf, req.outDataBuf, req.outPayload})
+	_, err := r.writevFD([][]byte{req.outHeaderBuf, req.outDataBuf, req.outPayload})
 	return ToStatus(err)
 }

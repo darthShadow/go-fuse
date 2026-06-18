@@ -94,7 +94,11 @@ func (r *fuseFD) trySplice(req *request, readResult ReadResult) error {
 	}
 
 	// Write header + payload to /dev/fuse.
-	_, err = pair.WriteTo(uintptr(r.fd), total)
+	if cerr := r.withFD(func(fd int) {
+		_, err = pair.WriteTo(uintptr(fd), total)
+	}); cerr != nil {
+		return cerr
+	}
 	return err
 }
 

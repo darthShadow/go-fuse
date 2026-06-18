@@ -267,7 +267,10 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 	}
 
 	ms.mountPoint = mountPoint
-	ms.fuseFD = ms.newFuseFD(fd)
+	ms.fuseFD, err = ms.newFuseFD(fd)
+	if err != nil {
+		return nil, err
+	}
 	ms.protocolServer.writev = ms.fuseFD.writev
 
 	if code := ms.handleInit(); !code.Ok() {
