@@ -67,8 +67,7 @@ type Server struct {
 	// Pool for request structs. Shared by all fuseFDs via pointer.
 	reqPool sync.Pool
 
-	// Pool for raw requests data. Shared by all fuseFDs via pointer;
-	// per-fd accounting lives on fuseFD.
+	// Pool manager for raw request input buffers. Each fuseFD uses one shard.
 	readPool bytePool
 
 	singleReader bool
@@ -123,6 +122,8 @@ func (ms *Server) RecordLatencies(l LatencyMap) {
 // in this case.
 func (ms *Server) Unmount() (err error) {
 	if ms.mountPoint == "" {
+		ms.waitLoops()
+		ms.stopAndDrainReadPool()
 		return nil
 	}
 	if parseFuseFd(ms.mountPoint) >= 0 {
@@ -146,6 +147,7 @@ func (ms *Server) Unmount() (err error) {
 	}
 	// Wait for event loops to exit.
 	ms.waitLoops()
+	ms.stopAndDrainReadPool()
 	ms.mountPoint = ""
 	return err
 }
@@ -155,6 +157,23 @@ func (ms *Server) waitLoops() {
 	for _, fd := range ms.fuseFDs {
 		fd.loops.Wait()
 	}
+}
+
+// stopAndDrainReadPool tears down the background reclaimer before clearing
+// retained buffers. Stop must happen before drain so a reclaim tick cannot
+// re-lower targetRetained after drain.
+//
+// On non-Linux single-reader builds (useSingleReader == true), request handlers
+// run as detached goroutines that waitLoops does not join, so a handler can
+// outlive this teardown and the surrounding Serve cleanup (fd close, OnUnmount).
+// Such a handler may Put a read buffer shortly after drain -- harmlessly
+// re-retained up to the shard cap and later reclaimed or GC'd -- and, as a
+// pre-existing upstream caveat, may still be running filesystem work past
+// unmount. Linux multi-reader builds keep handlers inside reader loops and are
+// unaffected.
+func (ms *Server) stopAndDrainReadPool() {
+	ms.readPool.stopReclaimer()
+	ms.readPool.drain()
 }
 
 // alignSlice ensures that the byte at alignedByte is aligned with the
@@ -265,13 +284,13 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			},
 		}
 	}
-	ms.readPool = newBytePool(readPoolMaxRetainedBuffers, func() interface{} {
+	ms.readPool.init(readPoolMaxRetainedBuffers, func() []byte {
 		// O_DIRECT alignment; sized via requestAccountingSizes so the bytePool
 		// allocator and inflight accounting share one size source.
 		buf := make([]byte, readBufBytes)
 		buf = alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(readBufSize))
 		return buf
-	})
+	}, time.Now)
 	mountPoint = filepath.Clean(mountPoint)
 	if !filepath.IsAbs(mountPoint) {
 		cwd, err := os.Getwd()
@@ -313,6 +332,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		effectiveCeiling := len(ms.fuseFDs) * o.MaxInflightRequestBytes
 		o.Logger.Printf("MaxInflightRequestBytes is enforced per fd: NumCloneFDs=%d, active fds=%d, per-fd ceiling=%d bytes, effective ceiling=%d bytes", o.NumCloneFDs, len(ms.fuseFDs), o.MaxInflightRequestBytes, effectiveCeiling)
 	}
+	ms.readPool.bindFDs(ms.fuseFDs)
 
 	// This prepares for Serve being called somewhere, either
 	// synchronously or asynchronously. One base reader per fuseFD.
@@ -433,6 +453,7 @@ func (ms *Server) Serve() {
 		log.Panic("Serve() must only be called once, you have called it a second time")
 	}
 	ms.serving = true
+	ms.readPool.startReclaimer()
 
 	// One base reader per fuseFD. With cloned fds these run
 	// concurrently against independent kernel queues.
@@ -441,6 +462,7 @@ func (ms *Server) Serve() {
 	}
 	ms.loop(ms.fuseFDs[0])
 	ms.waitLoops()
+	ms.stopAndDrainReadPool()
 
 	for _, ff := range ms.fuseFDs {
 		ff.close()

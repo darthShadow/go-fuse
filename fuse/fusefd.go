@@ -50,9 +50,9 @@ type fuseFD struct {
 	loops sync.WaitGroup
 
 	// Shared pools owned by Server (per-fd pointers; accounting is
-	// per-fd, the backing storage is shared).
+	// per-fd; each readPool shard is assigned by the Server).
 	reqPool  *sync.Pool
-	readPool *bytePool
+	readPool *bytePoolShard
 	buffers  *bufferPool
 
 	// Accounting constants, set once at fuseFD construction.
@@ -66,10 +66,11 @@ type fuseFD struct {
 func (ms *Server) newFuseFD(fd int) *fuseFD {
 	_, readBufBytes, reqAllocBytes := requestAccountingSizes(ms.opts.MaxWrite)
 	return &fuseFD{
-		server:        ms,
-		fd:            fd,
-		reqPool:       &ms.reqPool,
-		readPool:      &ms.readPool,
+		server:  ms,
+		fd:      fd,
+		reqPool: &ms.reqPool,
+		// Temporary: shard(0) is a placeholder; bindFDs rebinds each fd to its own shard before Serve.
+		readPool:      ms.readPool.shard(0),
 		buffers:       &ms.buffers,
 		reqAllocBytes: reqAllocBytes,
 		readBufBytes:  readBufBytes,

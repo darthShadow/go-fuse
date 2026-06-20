@@ -513,7 +513,9 @@ func (b *rawBridge) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 	}
 	out.OpenFlags = flags
 
+	b.mu.Lock()
 	b.addBackingID(child, f, &out.OpenOut)
+	b.mu.Unlock()
 	child.setEntryOut(&out.EntryOut)
 	b.setEntryOutTimeout(&out.EntryOut)
 	return fuse.OK
