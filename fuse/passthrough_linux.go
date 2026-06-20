@@ -17,9 +17,11 @@ const (
 func (r *fuseFD) registerBackingFd(m *BackingMap) (int32, syscall.Errno) {
 	var id uintptr
 	var errno syscall.Errno
-	r.withFD(func(fd int) {
+	if err := r.withFD(func(fd int) {
 		id, _, errno = syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(_DEV_IOC_BACKING_OPEN), uintptr(unsafe.Pointer(m)))
-	})
+	}); err != nil {
+		errno = syscall.EBADF
+	}
 	if r.server.opts.Debug {
 		r.server.opts.Logger.Printf("ioctl: BACKING_OPEN %v: id %d (%v)", m.string(), id, errno)
 	}
@@ -28,9 +30,11 @@ func (r *fuseFD) registerBackingFd(m *BackingMap) (int32, syscall.Errno) {
 
 func (r *fuseFD) unregisterBackingFd(id int32) syscall.Errno {
 	var errno syscall.Errno
-	r.withFD(func(fd int) {
+	if err := r.withFD(func(fd int) {
 		_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(_DEV_IOC_BACKING_CLOSE), uintptr(unsafe.Pointer(&id)))
-	})
+	}); err != nil {
+		errno = syscall.EBADF
+	}
 
 	if r.server.opts.Debug {
 		r.server.opts.Logger.Printf("ioctl: BACKING_CLOSE id %d: %v", id, errno)
@@ -46,12 +50,16 @@ func (r *fuseFD) unregisterBackingFd(id int32) syscall.Errno {
 // kernel, an inode can only have a single backing file, so multiple
 // Open/Create calls should coordinate to return a consistent backing
 // ID.
+//
+// Backing IDs are session-global, so this always targets the primary
+// fd (fuseFDs[0]).
 func (ms *Server) RegisterBackingFd(m *BackingMap) (int32, syscall.Errno) {
-	return ms.fuseFD.registerBackingFd(m)
+	return ms.fuseFDs[0].registerBackingFd(m)
 }
 
 // UnregisterBackingFd unregisters the given ID in the kernel. The ID
-// should have been acquired before using RegisterBackingFd.
+// should have been acquired before using RegisterBackingFd. Backing IDs
+// are session-global, so this always targets the primary fd (fuseFDs[0]).
 func (ms *Server) UnregisterBackingFd(id int32) syscall.Errno {
-	return ms.fuseFD.unregisterBackingFd(id)
+	return ms.fuseFDs[0].unregisterBackingFd(id)
 }

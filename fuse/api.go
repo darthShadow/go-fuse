@@ -178,6 +178,29 @@ type MountOptions struct {
 	// is still allowed through.
 	MaxInflightRequestBytes int
 
+	// NumCloneFDs opens this many additional /dev/fuse file
+	// descriptors and binds them to the mount session via
+	// FUSE_DEV_IOC_CLONE (Linux >= 4.2). Each active cloned fd has its
+	// own kernel queue and reader goroutine tree, which reduces
+	// single-fd read contention on many-core machines.
+	//
+	// Replies are written back through the fd from which the request was
+	// read. Session-global operations, such as notifications and
+	// RegisterBackingFd/UnregisterBackingFd, use the primary fd.
+	//
+	// Clone failures are logged and the server continues with the primary
+	// fd and any clones that were already opened. On non-Linux, clone
+	// attempts return ENOSYS through the stub implementation and the
+	// server continues without clones. Defaults to 0 (no cloning).
+	//
+	// MaxInflightRequestBytes is enforced per active fd. When the limit
+	// is at least one request's accounting size, the effective configured
+	// ceiling scales with active fds:
+	// (1 + active clones) * MaxInflightRequestBytes. If the limit is
+	// smaller than one request, each active fd can still admit one
+	// request.
+	NumCloneFDs int
+
 	// CongestionThreshold is the in-flight async-request count at which
 	// the kernel marks the FUSE backing-dev as congested, throttling new
 	// submissions. It corresponds to

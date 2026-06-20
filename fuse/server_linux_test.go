@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 type blockingWriteFS struct {
@@ -134,6 +135,42 @@ func TestMaxInflightRequestBytesLimitsLargeWritesAndKeepsReader(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			testMaxInflightRequestBytesLargeWrites(t, maxWrite, requestCount, tc.maxInflight, tc.wantBeforeRelease)
 		})
+	}
+}
+
+func TestMaxInflightRequestBytesBudgetIsPerFuseFD(t *testing.T) {
+	const maxWrite = 4096
+
+	_, readBufBytes, reqAllocBytes := requestAccountingSizes(maxWrite)
+	requestBytes := reqAllocBytes + readBufBytes
+	srv := &Server{
+		opts: &MountOptions{
+			MaxInflightRequestBytes: requestBytes,
+		},
+	}
+	primary := &fuseFD{
+		server:        srv,
+		reqAllocBytes: reqAllocBytes,
+		readBufBytes:  readBufBytes,
+	}
+	clone := &fuseFD{
+		server:        srv,
+		reqAllocBytes: reqAllocBytes,
+		readBufBytes:  readBufBytes,
+	}
+	srv.fuseFDs = []*fuseFD{primary, clone}
+
+	if !primary.reserveRequestBytes() {
+		t.Fatalf("primary.reserveRequestBytes() = false, want true for first request")
+	}
+	if primary.reserveRequestBytes() {
+		t.Fatalf("primary.reserveRequestBytes() = true for second request, want false with per-fd limit %d", requestBytes)
+	}
+	if !clone.reserveRequestBytes() {
+		t.Fatalf("clone.reserveRequestBytes() = false, want true because MaxInflightRequestBytes is per fd")
+	}
+	if got, want := primary.inflightRequestBytes+clone.inflightRequestBytes, 2*requestBytes; got != want {
+		t.Fatalf("total inflight bytes across active fds = %d, want %d", got, want)
 	}
 }
 
@@ -272,13 +309,413 @@ func waitForReader(t *testing.T, srv *Server) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		srv.fuseFD.reqMu.Lock()
-		readers := srv.fuseFD.reqReaders
-		srv.fuseFD.reqMu.Unlock()
+		var readers int
+		for _, fd := range srv.fuseFDs {
+			fd.reqMu.Lock()
+			readers += fd.reqReaders
+			fd.reqMu.Unlock()
+		}
 		if readers > 0 {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("timed out waiting for a request reader")
+}
+
+func TestWaitForReaderObservesCloneFD(t *testing.T) {
+	srv := &Server{
+		fuseFDs: []*fuseFD{
+			{},
+			{reqReaders: 1},
+		},
+	}
+
+	waitForReader(t, srv)
+}
+
+// minimalFS supports just enough operations to mount and stat the root.
+type minimalFS struct{ defaultRawFileSystem }
+
+func (*minimalFS) GetAttr(cancel <-chan struct{}, in *GetAttrIn, out *AttrOut) Status {
+	out.Attr = Attr{Ino: 1, Mode: S_IFDIR | 0755, Nlink: 2}
+	return OK
+}
+
+type pipeBackedFuseFD struct {
+	fd     *fuseFD
+	readFD int
+}
+
+func newPipeBackedFuseFD(t *testing.T, srv *Server) pipeBackedFuseFD {
+	t.Helper()
+
+	pipeFDs := []int{-1, -1}
+	if err := syscall.Pipe(pipeFDs); err != nil {
+		t.Fatalf("Pipe: %v", err)
+	}
+	if err := syscall.SetNonblock(pipeFDs[0], true); err != nil {
+		syscall.Close(pipeFDs[0])
+		syscall.Close(pipeFDs[1])
+		t.Fatalf("SetNonblock: %v", err)
+	}
+
+	fd, err := srv.newFuseFD(pipeFDs[1])
+	if err != nil {
+		syscall.Close(pipeFDs[0])
+		syscall.Close(pipeFDs[1])
+		t.Fatalf("newFuseFD: %v", err)
+	}
+	pipeFDs[1] = -1
+	t.Cleanup(func() {
+		if err := fd.close(); err != nil {
+			t.Errorf("close pipe-backed fuseFD: %v", err)
+		}
+		if err := syscall.Close(pipeFDs[0]); err != nil {
+			t.Errorf("close pipe read fd: %v", err)
+		}
+	})
+
+	return pipeBackedFuseFD{fd: fd, readFD: pipeFDs[0]}
+}
+
+func newHandleRequestTestServer(fs RawFileSystem) *Server {
+	opts := &MountOptions{Logger: log.New(io.Discard, "", 0)}
+	opts.setDefaults(fs)
+	srv := &Server{
+		opts: opts,
+	}
+	srv.protocolServer = protocolServer{
+		fileSystem:  fs,
+		retrieveTab: make(map[uint64]*retrieveCacheRequest),
+		opts:        opts,
+	}
+	return srv
+}
+
+func newGetAttrRequest(unique uint64) *requestAlloc {
+	getAttr := GetAttrIn{
+		InHeader: InHeader{
+			Length: uint32(unsafe.Sizeof(GetAttrIn{})),
+			Opcode: _OP_GETATTR,
+			Unique: unique,
+			NodeId: FUSE_ROOT_ID,
+		},
+	}
+	input := make([]byte, int(unsafe.Sizeof(getAttr)))
+	copy(input, unsafe.Slice((*byte)(unsafe.Pointer(&getAttr)), len(input)))
+	return &requestAlloc{
+		request: request{
+			cancel:   make(chan struct{}),
+			inputBuf: input,
+		},
+	}
+}
+
+func readPipeBytes(t *testing.T, name string, fd int) []byte {
+	t.Helper()
+
+	buf := make([]byte, 4096)
+	n, err := syscall.Read(fd, buf)
+	if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("%s pipe read: %v", name, err)
+	}
+	return buf[:n]
+}
+
+func outHeaderFromBytes(t *testing.T, buf []byte) OutHeader {
+	t.Helper()
+
+	if len(buf) < int(sizeOfOutHeader) {
+		t.Fatalf("reply length = %d, want at least %d", len(buf), int(sizeOfOutHeader))
+	}
+	var out OutHeader
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(&out)), int(sizeOfOutHeader)), buf[:int(sizeOfOutHeader)])
+	return out
+}
+
+func TestHandleRequestWritesReplyToOriginatingFuseFD(t *testing.T) {
+	const unique = 12345
+
+	srv := newHandleRequestTestServer(&minimalFS{})
+	primary := newPipeBackedFuseFD(t, srv)
+	clone := newPipeBackedFuseFD(t, srv)
+	srv.fuseFDs = []*fuseFD{primary.fd, clone.fd}
+	srv.protocolServer.writev = primary.fd.writev
+
+	if code := srv.handleRequest(clone.fd, newGetAttrRequest(unique)); !code.Ok() {
+		t.Fatalf("handleRequest status = %v, want OK", code)
+	}
+
+	primaryReply := readPipeBytes(t, "primary", primary.readFD)
+	cloneReply := readPipeBytes(t, "clone", clone.readFD)
+	if len(cloneReply) == 0 {
+		t.Fatalf("originating clone fd received no reply; primary fd received %d bytes", len(primaryReply))
+	}
+	if len(primaryReply) != 0 {
+		t.Fatalf("primary fd received %d reply bytes, want none for request handled on clone fd", len(primaryReply))
+	}
+	if got, want := len(cloneReply), int(sizeOfOutHeader)+int(unsafe.Sizeof(AttrOut{})); got != want {
+		t.Fatalf("clone reply length = %d, want %d", got, want)
+	}
+	out := outHeaderFromBytes(t, cloneReply)
+	if got := out.Unique; got != unique {
+		t.Fatalf("clone reply unique = %d, want %d", got, unique)
+	}
+	if got := out.Status; got != 0 {
+		t.Fatalf("clone reply status = %d, want 0", got)
+	}
+}
+
+func TestNumCloneFDs(t *testing.T) {
+	const want = 3
+
+	mnt := t.TempDir()
+	srv, err := NewServer(&minimalFS{}, mnt, &MountOptions{
+		NumCloneFDs: want - 1,
+		Logger:      log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := srv.Unmount(); err != nil {
+			t.Errorf("Unmount: %v", err)
+		}
+	})
+	gotFDs := len(srv.fuseFDs)
+
+	go srv.Serve()
+	if err := srv.WaitMount(); err != nil {
+		t.Fatal(err)
+	}
+
+	if gotFDs == 1 {
+		if err := srv.Unmount(); err != nil {
+			t.Fatalf("Unmount: %v", err)
+		}
+		t.Skipf("kernel lacks FUSE_DEV_IOC_CLONE support: len(fuseFDs) = %d, want %d", gotFDs, want)
+	}
+	if got := gotFDs; got != want {
+		t.Errorf("len(fuseFDs) = %d, want %d", got, want)
+	}
+	for i, fd := range srv.fuseFDs {
+		assertFuseFDLive(t, i, fd)
+	}
+
+	for i := 0; i < 64; i++ {
+		var st syscall.Stat_t
+		if err := syscall.Stat(mnt, &st); err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+	}
+
+	if err := srv.Unmount(); err != nil {
+		t.Fatalf("Unmount: %v", err)
+	}
+}
+
+func TestNumCloneFDsGracefulDegrade(t *testing.T) {
+	oldCloneFuseFDFn := cloneFuseFDFn
+	cloneFuseFDFn = func(src *fuseFD) (int, error) {
+		if got := src.server.kernelSettings.Minor; got == 0 {
+			t.Fatalf("kernelSettings.Minor = %d during clone attempt, want INIT completed before cloning", got)
+		}
+		return -1, syscall.ENOSYS
+	}
+	t.Cleanup(func() {
+		cloneFuseFDFn = oldCloneFuseFDFn
+	})
+
+	mnt := t.TempDir()
+	srv, err := NewServer(&minimalFS{}, mnt, &MountOptions{
+		NumCloneFDs: 2,
+		Logger:      log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := srv.Unmount(); err != nil {
+			t.Errorf("Unmount: %v", err)
+		}
+	})
+	if got, want := len(srv.fuseFDs), 1; got != want {
+		t.Fatalf("len(fuseFDs) = %d, want %d", got, want)
+	}
+
+	go srv.Serve()
+	if err := srv.WaitMount(); err != nil {
+		t.Fatal(err)
+	}
+
+	var st syscall.Stat_t
+	if err := syscall.Stat(mnt, &st); err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	if err := srv.Unmount(); err != nil {
+		t.Fatalf("Unmount: %v", err)
+	}
+}
+
+func TestNumCloneFDsPartialGracefulDegrade(t *testing.T) {
+	oldCloneFuseFDFn := cloneFuseFDFn
+	var cloneCalls int
+	cloneFuseFDFn = func(src *fuseFD) (int, error) {
+		cloneCalls++
+		if got := src.server.kernelSettings.Minor; got == 0 {
+			t.Fatalf("kernelSettings.Minor = %d during clone attempt %d, want INIT completed before cloning", got, cloneCalls)
+		}
+		if cloneCalls > 1 {
+			return -1, syscall.ENOSYS
+		}
+
+		var cloned int
+		var dupErr error
+		if err := src.withFD(func(rawFD int) {
+			cloned, dupErr = syscall.Dup(rawFD)
+		}); err != nil {
+			return -1, err
+		}
+		if dupErr != nil {
+			return -1, dupErr
+		}
+		return cloned, nil
+	}
+	t.Cleanup(func() {
+		cloneFuseFDFn = oldCloneFuseFDFn
+	})
+
+	mnt := t.TempDir()
+	srv, err := NewServer(&minimalFS{}, mnt, &MountOptions{
+		NumCloneFDs: 2,
+		Logger:      log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := srv.Unmount(); err != nil {
+			t.Errorf("Unmount: %v", err)
+		}
+	})
+	if got, want := cloneCalls, 2; got != want {
+		t.Fatalf("cloneFuseFDFn calls = %d, want %d", got, want)
+	}
+	if got, want := len(srv.fuseFDs), 2; got != want {
+		t.Fatalf("len(fuseFDs) = %d, want %d", got, want)
+	}
+	for i, fd := range srv.fuseFDs {
+		assertFuseFDLive(t, i, fd)
+	}
+
+	go srv.Serve()
+	if err := srv.WaitMount(); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 16; i++ {
+		var st syscall.Stat_t
+		if err := syscall.Stat(mnt, &st); err != nil {
+			t.Fatalf("stat %d: %v", i+1, err)
+		}
+	}
+
+	if err := srv.Unmount(); err != nil {
+		t.Fatalf("Unmount: %v", err)
+	}
+}
+
+func newFuseFDUnitTestServer() *Server {
+	opts := &MountOptions{Logger: log.New(io.Discard, "", 0)}
+	opts.setDefaults(&minimalFS{})
+	srv := &Server{
+		opts:       opts,
+		maxReaders: 1,
+	}
+	srv.reqPool.New = func() interface{} {
+		return &requestAlloc{
+			request: request{
+				cancel: make(chan struct{}),
+			},
+		}
+	}
+	srv.readPool.New = func() interface{} {
+		return make([]byte, _FUSE_MIN_READ_BUFFER)
+	}
+	return srv
+}
+
+func TestFuseFDClosedRawConnReturnsError(t *testing.T) {
+	srv := newFuseFDUnitTestServer()
+	pipeFDs := []int{-1, -1}
+	if err := syscall.Pipe(pipeFDs); err != nil {
+		t.Fatalf("Pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		if pipeFDs[1] >= 0 {
+			if err := syscall.Close(pipeFDs[1]); err != nil {
+				t.Errorf("close pipe write fd: %v", err)
+			}
+		}
+	})
+
+	fd, err := srv.newFuseFD(pipeFDs[0])
+	if err != nil {
+		syscall.Close(pipeFDs[0])
+		t.Fatalf("newFuseFD: %v", err)
+	}
+	pipeFDs[0] = -1
+	if err := fd.close(); err != nil {
+		t.Fatalf("fuseFD.close: %v", err)
+	}
+
+	called := false
+	if err := fd.withFD(func(int) {
+		called = true
+	}); err == nil {
+		t.Fatalf("withFD on closed fd returned nil error, want non-nil")
+	}
+	if called {
+		t.Fatalf("withFD invoked callback for closed fd")
+	}
+
+	req, code := fd.readRequest()
+	if req != nil {
+		t.Fatalf("readRequest on closed fd returned request %p, want nil", req)
+	}
+	if code.Ok() {
+		t.Fatalf("readRequest on closed fd status = %v, want non-OK", code)
+	}
+	fd.reqMu.Lock()
+	readers := fd.reqReaders
+	inflight := fd.inflightRequestBytes
+	fd.reqMu.Unlock()
+	if readers != 0 || inflight != 0 {
+		t.Fatalf("closed-fd readRequest cleanup left reqReaders=%d inflightRequestBytes=%d, want 0/0", readers, inflight)
+	}
+}
+
+func assertFuseFDLive(t *testing.T, index int, fd *fuseFD) {
+	t.Helper()
+
+	var called bool
+	var errno syscall.Errno
+	err := fd.withFD(func(rawFD int) {
+		called = true
+		_, _, errno = syscall.Syscall(syscall.SYS_FCNTL, uintptr(rawFD), uintptr(syscall.F_GETFD), 0)
+	})
+	if err != nil {
+		t.Fatalf("fuseFDs[%d].withFD: %v", index, err)
+	}
+	if !called {
+		t.Fatalf("fuseFDs[%d].withFD did not expose a RawConn fd", index)
+	}
+	if errno != 0 {
+		t.Fatalf("fcntl(F_GETFD) on fuseFDs[%d]: %v", index, errno)
+	}
 }

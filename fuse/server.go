@@ -38,6 +38,8 @@ const (
 	maxMaxReaders = 16
 )
 
+var cloneFuseFDFn = cloneFuseFD
+
 // Server contains the logic for reading from the FUSE device.
 type Server struct {
 	protocolServer
@@ -45,7 +47,11 @@ type Server struct {
 	// Empty if unmounted.
 	mountPoint string
 
-	fuseFD *fuseFD
+	// fuseFDs[0] is the original /dev/fuse fd from mount(2).
+	// fuseFDs[1:] are FUSE_DEV_IOC_CLONE'd siblings. Each active fd has
+	// its own kernel queue, reader goroutine tree, and request-byte
+	// accounting in fuseFD.
+	fuseFDs []*fuseFD
 
 	opts *MountOptions
 
@@ -110,6 +116,7 @@ func (ms *Server) RecordLatencies(l LatencyMap) {
 // in this case.
 func (ms *Server) Unmount() (err error) {
 	if ms.mountPoint == "" {
+		ms.waitLoops()
 		return nil
 	}
 	if parseFuseFd(ms.mountPoint) >= 0 {
@@ -132,9 +139,16 @@ func (ms *Server) Unmount() (err error) {
 		return
 	}
 	// Wait for event loops to exit.
-	ms.fuseFD.loops.Wait()
+	ms.waitLoops()
 	ms.mountPoint = ""
 	return err
+}
+
+// waitLoops blocks until every active fuseFD's reader tree has drained.
+func (ms *Server) waitLoops() {
+	for _, fd := range ms.fuseFDs {
+		fd.loops.Wait()
+	}
 }
 
 // alignSlice ensures that the byte at alignedByte is aligned with the
@@ -267,21 +281,43 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 	}
 
 	ms.mountPoint = mountPoint
-	ms.fuseFD, err = ms.newFuseFD(fd)
+	primary, err := ms.newFuseFD(fd)
 	if err != nil {
 		return nil, err
 	}
-	ms.protocolServer.writev = ms.fuseFD.writev
+	ms.fuseFDs = []*fuseFD{primary}
+	ms.protocolServer.writev = ms.fuseFDs[0].writev
 
 	if code := ms.handleInit(); !code.Ok() {
-		ms.fuseFD.close()
+		ms.fuseFDs[0].close()
 		// TODO - unmount as well?
 		return nil, fmt.Errorf("init: %s", code)
 	}
 
+	// INIT has run on the primary fd. Cloned fds bind to the same
+	// session but each has an independent kernel queue. Clone failures
+	// are non-fatal: the primary and any already-opened clones continue
+	// serving requests.
+	for i := 0; i < o.NumCloneFDs; i++ {
+		cloned, err := cloneFuseFDFn(ms.fuseFDs[0])
+		if err != nil {
+			o.Logger.Printf("FUSE_DEV_IOC_CLONE failed at clone %d/%d: %v; continuing with %d fd(s)", i+1, o.NumCloneFDs, err, len(ms.fuseFDs))
+			continue
+		}
+		clonedFD, err := ms.newFuseFD(cloned)
+		if err != nil {
+			// newFuseFD closes cloned before returning an error.
+			o.Logger.Printf("newFuseFD failed for clone %d/%d: %v; continuing with %d fd(s)", i+1, o.NumCloneFDs, err, len(ms.fuseFDs))
+			continue
+		}
+		ms.fuseFDs = append(ms.fuseFDs, clonedFD)
+	}
+
 	// This prepares for Serve being called somewhere, either
-	// synchronously or asynchronously.
-	ms.fuseFD.loops.Add(1)
+	// synchronously or asynchronously. Use one base reader per active fd.
+	for _, fd := range ms.fuseFDs {
+		fd.loops.Add(1)
+	}
 	return ms, nil
 }
 
@@ -348,9 +384,11 @@ func (o *MountOptions) containsOption(opt string) bool {
 // purposes.
 func (ms *Server) DebugData() string {
 	var r int
-	ms.fuseFD.reqMu.Lock()
-	r = ms.fuseFD.reqReaders
-	ms.fuseFD.reqMu.Unlock()
+	for _, fd := range ms.fuseFDs {
+		fd.reqMu.Lock()
+		r += fd.reqReaders
+		fd.reqMu.Unlock()
+	}
 
 	return fmt.Sprintf("readers: %d", r)
 }
@@ -388,10 +426,15 @@ func (ms *Server) Serve() {
 	}
 	ms.serving = true
 
-	ms.loop()
-	ms.fuseFD.loops.Wait()
+	for i := 1; i < len(ms.fuseFDs); i++ {
+		go ms.loop(ms.fuseFDs[i])
+	}
+	ms.loop(ms.fuseFDs[0])
+	ms.waitLoops()
 
-	ms.fuseFD.close()
+	for _, fd := range ms.fuseFDs {
+		fd.close()
+	}
 
 	// shutdown in-flight cache retrieves.
 	//
@@ -416,21 +459,23 @@ func (ms *Server) Serve() {
 // Wait waits for the serve loop to exit. This should only be called
 // after Serve has been called, or it will hang indefinitely.
 func (ms *Server) Wait() {
-	ms.fuseFD.loops.Wait()
+	ms.waitLoops()
 }
 
 func (ms *Server) handleInit() Status {
 	// The first request should be INIT; read it synchronously,
-	// and don't spawn new readers.
+	// and don't spawn new readers. Clones are opened only after
+	// INIT succeeds, so this always uses the primary fd.
+	primary := ms.fuseFDs[0]
 	orig := ms.singleReader
 	ms.singleReader = true
-	req, errNo := ms.fuseFD.readRequest()
+	req, errNo := primary.readRequest()
 	ms.singleReader = orig
 
 	if errNo != OK || req == nil {
 		return errNo
 	}
-	if code := ms.handleRequest(req); !code.Ok() {
+	if code := ms.handleRequest(primary, req); !code.Ok() {
 		return code
 	}
 
@@ -471,11 +516,11 @@ func (ms *Server) handleInit() Status {
 // BenchmarkGoFuseStat-2          	    9310	    121332 ns/op
 // BenchmarkGoFuseReaddir         	    4074	    361568 ns/op
 // BenchmarkGoFuseReaddir-2       	    3511	    319765 ns/op
-func (ms *Server) loop() {
-	defer ms.fuseFD.loops.Done()
+func (ms *Server) loop(fd *fuseFD) {
+	defer fd.loops.Done()
 exit:
 	for {
-		req, errNo := ms.fuseFD.readRequest()
+		req, errNo := fd.readRequest()
 		switch errNo {
 		case OK:
 			if req == nil {
@@ -497,16 +542,16 @@ exit:
 			break exit
 		}
 
-		if ms.singleReader && ms.fuseFD.canAcceptAnother() {
-			go ms.handleRequest(req)
+		if ms.singleReader && fd.canAcceptAnother() {
+			go ms.handleRequest(fd, req)
 			continue
 		}
-		ms.handleRequest(req)
+		ms.handleRequest(fd, req)
 	}
 }
 
-func (ms *Server) handleRequest(req *requestAlloc) Status {
-	defer ms.fuseFD.returnRequest(req)
+func (ms *Server) handleRequest(fd *fuseFD, req *requestAlloc) Status {
+	defer fd.returnRequest(req)
 	if ms.opts.SingleThreaded {
 		ms.requestProcessingMu.Lock()
 		defer ms.requestProcessingMu.Unlock()
@@ -533,7 +578,7 @@ func (ms *Server) handleRequest(req *requestAlloc) Status {
 	if req.suppressReply {
 		return OK
 	}
-	errno := ms.fuseFD.write(&req.request)
+	errno := fd.write(&req.request)
 	if errno != 0 {
 		// Ignore ENOENT for INTERRUPT responses which
 		// indicates that the referred request is no longer

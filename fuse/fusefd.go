@@ -18,9 +18,9 @@ import (
 // owning Server via pointers, and a back pointer to the Server gives the
 // per-fd methods access to shared configuration and callbacks.
 //
-// Today a Server has a single fuseFD; this struct exists so that adding
-// support for FUSE_DEV_IOC_CLONE'd fds is a matter of widening the field
-// to a slice.
+// Server.fuseFDs[0] is the original /dev/fuse fd from mount(2).
+// Server.fuseFDs[1:] are FUSE_DEV_IOC_CLONE'd siblings. Each fd has an
+// independent kernel queue, reader tree, and request-byte accounting.
 type fuseFD struct {
 	server *Server
 
@@ -50,7 +50,8 @@ type fuseFD struct {
 
 // newFuseFD returns a fuseFD bound to ms and ready to read from fd.
 // Ownership of fd passes to the returned fuseFD's *os.File. All shared
-// state (pools, buffer pool, accounting constants) is wired up here.
+// state (pools, buffer pool, accounting constants) is wired up here. If
+// RawConn setup fails, fd is closed before the error is returned.
 func (ms *Server) newFuseFD(fd int) (*fuseFD, error) {
 	file := os.NewFile(uintptr(fd), "/dev/fuse")
 	conn, err := file.SyscallConn()
@@ -154,7 +155,7 @@ func (r *fuseFD) readRequest() (req *requestAlloc, code Status) {
 	r.reqReaders--
 	if !ms.singleReader && r.reqReaders <= 0 && !needsBackPressure {
 		r.loops.Add(1)
-		go ms.loop()
+		go ms.loop(r)
 	}
 
 	return req, OK
