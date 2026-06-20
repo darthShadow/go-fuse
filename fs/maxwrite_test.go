@@ -7,8 +7,10 @@
 package fs
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -151,6 +153,21 @@ func TestMaxWrite(t *testing.T) {
 	for _, tc := range testcases {
 		name := fmt.Sprintf("MaxWr%d.MaxRa%d", tc.MaxWrite, tc.MaxReadAhead)
 		t.Run(name, func(t *testing.T) {
+			var logBuf bytes.Buffer
+			tc.Logger = log.New(&logBuf, "", 0)
+			// The real splice-skip regression guard is the OS-level
+			// largestRead/read-size assertion below. This log assertion only
+			// catches unexpected non-errRecoverSplice trySplice errors;
+			// errRecoverSplice takes the silent path and is never logged.
+			// Registered before testMount so this runs after server.Unmount
+			// (LIFO): all server goroutines have quiesced before logBuf is read,
+			// avoiding races with late readahead.
+			t.Cleanup(func() {
+				if got := logBuf.String(); strings.Contains(got, "trySplice:") {
+					t.Errorf("unexpected trySplice fallback log:\n%s", got)
+				}
+			})
+
 			root := &maxWriteTestRoot{}
 			root.resetStats()
 

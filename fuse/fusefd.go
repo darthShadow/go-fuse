@@ -170,11 +170,12 @@ func (r *fuseFD) returnRequest(req *requestAlloc) {
 		req.interrupted = false
 		req.cancel = make(chan struct{}, 0)
 	}
+	p := req.bufferPoolInputBuf
+	req.bufferPoolInputBuf = nil
 	req.clear()
 
 	r.reqMu.Lock()
-	if p := req.bufferPoolInputBuf; p != nil {
-		req.bufferPoolInputBuf = nil
+	if p != nil {
 		r.putReadBuf(p)
 	}
 	r.putReq(req)
@@ -206,11 +207,13 @@ func (r *fuseFD) requestBytes() int {
 	return r.reqAllocBytes + r.readBufBytes
 }
 
+// Caller must hold r.reqMu.
 func (r *fuseFD) putReadBuf(buf []byte) {
 	r.readPool.Put(buf)
 	r.inflightRequestBytes -= r.readBufBytes
 }
 
+// Caller must hold r.reqMu.
 func (r *fuseFD) putReq(req *requestAlloc) {
 	r.reqPool.Put(req)
 	r.inflightRequestBytes -= r.reqAllocBytes

@@ -31,6 +31,12 @@ func (s *Server) setSplice() {
 // would carry the wrong total length, so we return an error and let the
 // caller fall back to a Pread-based path.
 func (r *fuseFD) trySplice(req *request, readResult ReadResult) error {
+	if _, ok := readResult.(seekableResult); !ok {
+		if _, ok := readResult.(statefulResult); !ok {
+			return errRecoverSplice
+		}
+	}
+
 	// The caller (handleRequest) already called req.serializeHeader with
 	// readResult.Size(), so req.outHeaderBuf is correct for the optimistic case.
 	total := len(req.outHeaderBuf) + len(req.outDataBuf) + readResult.Size()
