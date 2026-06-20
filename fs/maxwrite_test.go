@@ -155,10 +155,10 @@ func TestMaxWrite(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var logBuf bytes.Buffer
 			tc.Logger = log.New(&logBuf, "", 0)
-			// The real splice-skip regression guard is the OS-level
-			// largestRead/read-size assertion below. This log assertion only
-			// catches unexpected non-errRecoverSplice trySplice errors;
-			// errRecoverSplice takes the silent path and is never logged.
+			// Direct splice-skip guard coverage lives in fuse/splice_linux_test.go.
+			// This log assertion only catches unexpected non-errRecoverSplice
+			// trySplice errors; errRecoverSplice takes the silent path and is
+			// never logged.
 			// Registered before testMount so this runs after server.Unmount
 			// (LIFO): all server goroutines have quiesced before logBuf is read,
 			// avoiding races with late readahead.

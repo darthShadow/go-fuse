@@ -64,8 +64,8 @@ type Server struct {
 	// Pool for request structs.
 	reqPool sync.Pool
 
-	// Pool for raw requests data
-	readPool sync.Pool
+	// Pool manager for raw request input buffers. Each fuseFD uses one shard.
+	readPool bytePool
 
 	singleReader bool
 	canSplice    bool
@@ -117,6 +117,7 @@ func (ms *Server) RecordLatencies(l LatencyMap) {
 func (ms *Server) Unmount() (err error) {
 	if ms.mountPoint == "" {
 		ms.waitLoops()
+		ms.stopAndDrainReadPool()
 		return nil
 	}
 	if parseFuseFd(ms.mountPoint) >= 0 {
@@ -140,6 +141,7 @@ func (ms *Server) Unmount() (err error) {
 	}
 	// Wait for event loops to exit.
 	ms.waitLoops()
+	ms.stopAndDrainReadPool()
 	ms.mountPoint = ""
 	return err
 }
@@ -149,6 +151,11 @@ func (ms *Server) waitLoops() {
 	for _, fd := range ms.fuseFDs {
 		fd.loops.Wait()
 	}
+}
+
+func (ms *Server) stopAndDrainReadPool() {
+	ms.readPool.stopReclaimer()
+	ms.readPool.closeAndDrain()
 }
 
 // alignSlice ensures that the byte at alignedByte is aligned with the
@@ -258,15 +265,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 			},
 		}
 	}
-	ms.readPool.New = func() interface{} {
-		// O_DIRECT typically requires buffers aligned to
-		// blocksize (see man 2 open), but requirements vary
-		// across file systems. Presumably, we could also fix
-		// this by reading the requests using readv.
-		buf := make([]byte, readBufBytes)
-		buf = alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(readBufSize))
-		return buf
-	}
+	ms.initReadPool(readBufSize, readBufBytes)
 	mountPoint = filepath.Clean(mountPoint)
 	if !filepath.IsAbs(mountPoint) {
 		cwd, err := os.Getwd()
@@ -312,6 +311,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		}
 		ms.fuseFDs = append(ms.fuseFDs, clonedFD)
 	}
+	ms.readPool.bindFDs(ms.fuseFDs)
 
 	// This prepares for Serve being called somewhere, either
 	// synchronously or asynchronously. Use one base reader per active fd.
@@ -329,6 +329,29 @@ func requestAccountingSizes(maxWrite int) (readBufSize, readBufBytes, reqAllocBy
 	readBufBytes = readBufSize + logicalBlockSize
 	reqAllocBytes = int(unsafe.Sizeof(requestAlloc{}))
 	return
+}
+
+func (ms *Server) initReadPool(readBufSize, readBufBytes int) {
+	ms.readPool.init(readPoolMaxRetainedBuffers, func() []byte {
+		// O_DIRECT typically requires buffers aligned to blocksize (see
+		// man 2 open), but requirements vary across file systems.
+		buf := make([]byte, readBufBytes)
+		buf = alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(readBufSize))
+		return buf
+	}, time.Now)
+}
+
+func (ms *Server) ensureReadPool(readBufSize, readBufBytes int) {
+	if ms.readPool.initialized() {
+		return
+	}
+	if newFn := ms.readPool.New; newFn != nil {
+		ms.readPool.init(readPoolMaxRetainedBuffers, func() []byte {
+			return newFn().([]byte)
+		}, time.Now)
+		return
+	}
+	ms.initReadPool(readBufSize, readBufBytes)
 }
 
 func escape(optionValue string) string {
@@ -425,12 +448,15 @@ func (ms *Server) Serve() {
 		log.Panic("Serve() must only be called once, you have called it a second time")
 	}
 	ms.serving = true
+	ms.readPool.startReclaimer()
+	defer ms.stopAndDrainReadPool()
 
 	for i := 1; i < len(ms.fuseFDs); i++ {
 		go ms.loop(ms.fuseFDs[i])
 	}
 	ms.loop(ms.fuseFDs[0])
 	ms.waitLoops()
+	ms.stopAndDrainReadPool()
 
 	for _, fd := range ms.fuseFDs {
 		fd.close()

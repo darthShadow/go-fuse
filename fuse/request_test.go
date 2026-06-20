@@ -105,17 +105,19 @@ func TestSetInputBoundary(t *testing.T) {
 func TestReturnRequestSaveBeforeClear(t *testing.T) {
 	// T1 catches an inc2 reversion where returnRequest clears bufferPoolInputBuf
 	// before saving it, so the read buffer is not returned exactly once.
-	savedInput := make([]byte, 32)
+	newReadBufCalls := 0
+	readPool := newBytePool(1, func() []byte {
+		buf := make([]byte, 32)
+		for i := range buf {
+			buf[i] = byte(i + 1)
+		}
+		newReadBufCalls++
+		return buf
+	}).shard(0)
+	savedInput := readPool.Get()
+	newReadBufCalls = 0
 	req := &requestAlloc{
 		bufferPoolInputBuf: savedInput,
-	}
-	newReadBuf := make([]byte, len(savedInput))
-	newReadBufCalls := 0
-	readPool := &sync.Pool{
-		New: func() interface{} {
-			newReadBufCalls++
-			return newReadBuf
-		},
 	}
 	reqPool := &sync.Pool{}
 	fd := &fuseFD{
@@ -134,16 +136,16 @@ func TestReturnRequestSaveBeforeClear(t *testing.T) {
 	if got := fd.inflightRequestBytes; got != 0 {
 		t.Errorf("inflightRequestBytes after returnRequest: got=%d want=0", got)
 	}
-	gotReadBuf := readPool.Get().([]byte)
+	gotReadBuf := readPool.Get()
 	if !sameSliceData(gotReadBuf, savedInput) {
 		t.Fatalf("first readPool buffer aliases saved input: got=%t want=true", sameSliceData(gotReadBuf, savedInput))
 	}
-	secondReadBuf := readPool.Get().([]byte)
+	secondReadBuf := readPool.Get()
 	if sameSliceData(secondReadBuf, savedInput) {
 		t.Fatalf("second readPool buffer aliases saved input: got=true want=false")
 	}
 	if newReadBufCalls != 1 {
-		t.Errorf("readPool New calls after two Gets: got=%d want=1", newReadBufCalls)
+		t.Errorf("readPool allocator calls after two Gets: got=%d want=1", newReadBufCalls)
 	}
 	gotReq := reqPool.Get().(*requestAlloc)
 	if gotReq != req {

@@ -38,9 +38,9 @@ type fuseFD struct {
 	// loops tracks reader goroutines servicing fd.
 	loops sync.WaitGroup
 
-	// Shared pools owned by Server.
+	// Shared pools owned by Server. readPool is this fd's origin shard.
 	reqPool  *sync.Pool
-	readPool *sync.Pool
+	readPool *bytePoolShard
 	buffers  *bufferPool
 
 	// Accounting constants, set once at server construction.
@@ -59,13 +59,14 @@ func (ms *Server) newFuseFD(fd int) (*fuseFD, error) {
 		file.Close()
 		return nil, err
 	}
-	_, readBufBytes, reqAllocBytes := requestAccountingSizes(ms.opts.MaxWrite)
+	readBufSize, readBufBytes, reqAllocBytes := requestAccountingSizes(ms.opts.MaxWrite)
+	ms.ensureReadPool(readBufSize, readBufBytes)
 	return &fuseFD{
 		server:        ms,
 		file:          file,
 		conn:          conn,
 		reqPool:       &ms.reqPool,
-		readPool:      &ms.readPool,
+		readPool:      ms.readPool.shard(0),
 		buffers:       &ms.buffers,
 		reqAllocBytes: reqAllocBytes,
 		readBufBytes:  readBufBytes,
@@ -111,7 +112,7 @@ func (r *fuseFD) readRequest() (req *requestAlloc, code Status) {
 	r.reqMu.Unlock()
 
 	req = r.reqPool.Get().(*requestAlloc)
-	dest := r.readPool.Get().([]byte)
+	dest := r.readPool.Get()
 
 	var n int
 	err := handleEINTR(func() error {

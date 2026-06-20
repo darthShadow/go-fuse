@@ -2,6 +2,7 @@ package fs
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dolthub/maphash"
@@ -15,15 +16,15 @@ const (
 	mapShrinkFactor = 8                // Shrink factor for map compaction
 )
 
-type inode struct{}
-
 // mapShard provides a sharded generic map implementation
 type mapShard[K comparable, V any] struct {
-	mu        sync.RWMutex
-	pool      *mapPool[K, V]
-	entries   map[K]V
-	count     int32 // Counter for total nodes
-	countHigh int32 // Counter for high water mark
+	mu      sync.RWMutex
+	pool    *mapPool[K, V]
+	entries map[K]V
+	// count and countHigh are guarded by s.mu: mutations hold the write lock and
+	// Count() reads under RLock, so RWMutex serializes all access.
+	count     int32
+	countHigh int32
 }
 
 func (s *mapShard[K, V]) Get(id K) (V, bool) {
@@ -47,15 +48,14 @@ func (s *mapShard[K, V]) Set(id K, val V) {
 		s.entries = s.pool.Get(defaultMapSize)
 	}
 
-	if _, exists := s.entries[id]; exists {
-		s.count--
-	}
-
+	_, exists := s.entries[id]
 	s.entries[id] = val
-	s.count++
 
-	if s.count > s.countHigh {
-		s.countHigh = s.count
+	if !exists {
+		s.count++
+		if s.count > s.countHigh {
+			s.countHigh = s.count
+		}
 	}
 }
 
@@ -84,7 +84,8 @@ func (s *mapShard[K, V]) Compact() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.count == 0 {
+	count := s.count
+	if count == 0 {
 		if s.entries != nil {
 			s.pool.Put(s.entries)
 			s.entries = nil
@@ -95,15 +96,16 @@ func (s *mapShard[K, V]) Compact() {
 		return
 	}
 
-	if s.count > maxMapSize {
+	if count > maxMapSize {
 		return
 	}
 
-	if s.count*mapShrinkFactor >= s.countHigh {
+	countHigh := s.countHigh
+	if count*mapShrinkFactor >= countHigh {
 		return
 	}
 
-	newMap := s.pool.Get(uint32(s.count) * 2)
+	newMap := s.pool.Get(uint32(count) * 2)
 	for id, val := range s.entries {
 		newMap[id] = val
 	}
@@ -111,8 +113,9 @@ func (s *mapShard[K, V]) Compact() {
 	s.pool.Put(s.entries)
 	s.entries = newMap
 
-	s.count = int32(len(newMap))
-	s.countHigh = int32(len(newMap))
+	newCount := int32(len(newMap))
+	s.count = newCount
+	s.countHigh = newCount
 }
 
 func (s *mapShard[K, V]) Count() int32 {
@@ -125,7 +128,7 @@ func (s *mapShard[K, V]) Count() int32 {
 type shardedMap[K comparable, V any] struct {
 	hasher      maphash.Hasher[K]
 	shards      [mapShards]*mapShard[K, V]
-	lastCompact time.Time
+	lastCompact atomic.Int64
 }
 
 func (m *shardedMap[K, V]) Init() {
@@ -171,11 +174,17 @@ func (m *shardedMap[K, V]) Delete(id K) {
 }
 
 func (m *shardedMap[K, V]) Compact() {
-	if time.Since(m.lastCompact) < 5*time.Minute {
-		return
+	now := time.Now()
+	nowNanos := now.UnixNano()
+	for {
+		last := m.lastCompact.Load()
+		if now.Sub(time.Unix(0, last)) < 5*time.Minute {
+			return
+		}
+		if m.lastCompact.CompareAndSwap(last, nowNanos) {
+			break
+		}
 	}
-
-	m.lastCompact = time.Now()
 
 	var wg sync.WaitGroup
 	shards := m.shards[:]

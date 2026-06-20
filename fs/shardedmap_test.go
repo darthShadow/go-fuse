@@ -1,9 +1,22 @@
 package fs
 
 import (
-	"sync/atomic"
 	"testing"
 )
+
+type inode struct{}
+
+func shardCount[K comparable, V any](shard *mapShard[K, V]) int32 {
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	return shard.count
+}
+
+func shardCountHigh[K comparable, V any](shard *mapShard[K, V]) int32 {
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	return shard.countHigh
+}
 
 func TestNodeMapInit(t *testing.T) {
 	m := &shardedMap[uint64, *inode]{}
@@ -40,7 +53,7 @@ func TestNodeMapShardOperations(t *testing.T) {
 	}
 
 	// Verify count tracking
-	if count := atomic.LoadInt32(&shard.count); count != 1 {
+	if count := shardCount(shard); count != 1 {
 		t.Errorf("count = %d, want 1", count)
 	}
 
@@ -50,13 +63,13 @@ func TestNodeMapShardOperations(t *testing.T) {
 	if got, _ := shard.Get(1); got != node2 {
 		t.Error("Set did not overwrite existing entry")
 	}
-	if count := atomic.LoadInt32(&shard.count); count != 1 {
+	if count := shardCount(shard); count != 1 {
 		t.Errorf("count after overwrite = %d, want 1", count)
 	}
 
 	// Test Delete with count verification
 	shard.Delete(1)
-	if count := atomic.LoadInt32(&shard.count); count != 0 {
+	if count := shardCount(shard); count != 0 {
 		t.Errorf("count after delete = %d, want 0", count)
 	}
 }
@@ -107,11 +120,11 @@ func TestNodeMapShardConcurrent(t *testing.T) {
 	}
 
 	// Verify shard is in consistent state
-	count := atomic.LoadInt32(&shard.count)
+	count := shardCount(shard)
 	if count < 0 {
 		t.Errorf("count became negative: %d", count)
 	}
-	high := atomic.LoadInt32(&shard.countHigh)
+	high := shardCountHigh(shard)
 	if count > high {
 		t.Errorf("count (%d) exceeded high water mark (%d)", count, high)
 	}
@@ -149,10 +162,10 @@ func TestNodeMapShardCompactionThresholds(t *testing.T) {
 	if shard.entries != nil {
 		t.Error("entries not nil after deleting everything")
 	}
-	if count := atomic.LoadInt32(&shard.count); count != 0 {
+	if count := shardCount(shard); count != 0 {
 		t.Errorf("count = %d after complete deletion", count)
 	}
-	if high := atomic.LoadInt32(&shard.countHigh); high != 0 {
+	if high := shardCountHigh(shard); high != 0 {
 		t.Errorf("high water mark = %d after complete deletion", high)
 	}
 }
@@ -161,10 +174,13 @@ func TestNodeMapEdgeCases(t *testing.T) {
 	m := &shardedMap[uint64, *inode]{}
 	m.Init()
 
-	// Test setting nil node
+	// Test setting nil node stores a nil entry
 	m.Set(1, nil)
-	if got, _ := m.Get(1); got != nil {
-		t.Error("Set(nil) should not store anything")
+	if got, ok := m.Get(1); !ok || got != nil {
+		t.Errorf("Set(nil) = (%v, %v), want stored nil", got, ok)
+	}
+	if count := m.Count(); count != 1 {
+		t.Errorf("count after Set(nil) = %d, want 1", count)
 	}
 
 	// Test deleting non-existent key
@@ -177,14 +193,14 @@ func TestNodeMapEdgeCases(t *testing.T) {
 	}
 
 	shard := m.getMapShard(0)
-	high := atomic.LoadInt32(&shard.countHigh)
+	high := shardCountHigh(shard)
 
 	// Add more to same shard
 	for i := uint64(mapShards); i < mapShards+10; i++ {
 		m.Set(i, node)
 	}
 
-	newHigh := atomic.LoadInt32(&shard.countHigh)
+	newHigh := shardCountHigh(shard)
 	if newHigh <= high {
 		t.Error("high water mark did not increase with more entries")
 	}
@@ -193,7 +209,7 @@ func TestNodeMapEdgeCases(t *testing.T) {
 	m.Delete(1)
 	m.Delete(1) // Should not make count go negative
 
-	if count := atomic.LoadInt32(&shard.count); count < 0 {
+	if count := shardCount(shard); count < 0 {
 		t.Errorf("multiple deletes caused negative count: %d", count)
 	}
 }
@@ -262,7 +278,7 @@ func TestHighWaterMark(t *testing.T) {
 		shard.Set(i, &inode{})
 	}
 
-	initialHigh := atomic.LoadInt32(&shard.countHigh)
+	initialHigh := shardCountHigh(shard)
 
 	// Delete some entries but stay above 1/4
 	for i := uint64(0); i < uint64(valueCount)/2; i++ {
@@ -270,7 +286,7 @@ func TestHighWaterMark(t *testing.T) {
 	}
 
 	// High water mark should not have changed
-	if atomic.LoadInt32(&shard.countHigh) != initialHigh {
+	if shardCountHigh(shard) != initialHigh {
 		t.Error("high water mark changed when count > 1/4")
 	}
 
@@ -280,7 +296,7 @@ func TestHighWaterMark(t *testing.T) {
 	}
 
 	// High water mark should have been adjusted
-	if atomic.LoadInt32(&shard.countHigh) >= initialHigh {
+	if shardCountHigh(shard) >= initialHigh {
 		t.Error("high water mark not adjusted when count < 1/4")
 	}
 }

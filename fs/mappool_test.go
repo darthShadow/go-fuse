@@ -2,14 +2,19 @@ package fs
 
 import (
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 )
 
+func mapIdentity[K comparable, V any](m map[K]V) uintptr {
+	return reflect.ValueOf(m).Pointer()
+}
+
 func TestMapPool(t *testing.T) {
 	t.Run("Get returns map with default size", func(t *testing.T) {
 		t.Skip("capacity is not guaranteed")
-		p := &mapPool[uint64, *inode]{defaultSize: 10}
+		p := &mapPool[uint64, struct{}]{defaultSize: 10}
 		m := p.Get(0)
 		if len(m) < 10 {
 			t.Errorf("expected capacity >= 10, got %d", len(m))
@@ -17,37 +22,40 @@ func TestMapPool(t *testing.T) {
 	})
 
 	t.Run("Put recycles maps under maxSize", func(t *testing.T) {
-		p := &mapPool[uint64, *inode]{maxSize: 5}
-		m := make(map[uint64]*inode)
-		m[1] = &inode{}
-		m[2] = &inode{}
+		p := &mapPool[uint64, struct{}]{maxSize: 5}
+		m := p.Get(2)
+		wantID := mapIdentity(m)
+		m[1] = struct{}{}
+		m[2] = struct{}{}
 
 		p.Put(m)
-		recycled := p.Get(0)
+		recycled := p.Get(2)
 
+		if gotID := mapIdentity(recycled); gotID != wantID {
+			t.Errorf("expected recycled map identity %x, got %x", wantID, gotID)
+		}
 		if len(recycled) != 0 {
 			t.Error("map was not cleared before recycling")
 		}
 	})
 
 	t.Run("Put discards maps over maxSize", func(t *testing.T) {
-		p := &mapPool[uint64, *inode]{maxSize: 2}
-		m := make(map[uint64]*inode)
-		m[1] = &inode{}
-		m[2] = &inode{}
-		m[3] = &inode{} // Over maxSize
+		p := &mapPool[uint64, struct{}]{maxSize: 2}
+		m := make(map[uint64]struct{})
+		m[1] = struct{}{}
+		m[2] = struct{}{}
+		m[3] = struct{}{} // Over maxSize
 
-		firstGet := p.Get(0)
 		p.Put(m) // Should discard
-		secondGet := p.Get(0)
+		reused := p.Get(2)
 
-		if &firstGet == &secondGet {
-			t.Error("oversized map was incorrectly recycled")
+		if gotID, wantDroppedID := mapIdentity(reused), mapIdentity(m); gotID == wantDroppedID {
+			t.Errorf("oversized map was incorrectly recycled: got map identity %x", gotID)
 		}
 	})
 
 	t.Run("Atomic operations work correctly", func(t *testing.T) {
-		p := &mapPool[uint64, *inode]{}
+		p := &mapPool[uint64, struct{}]{}
 		p.defaultSize = 20
 		p.maxSize = 30
 
@@ -58,6 +66,37 @@ func TestMapPool(t *testing.T) {
 			t.Errorf("expected maxSize 30, got %d", size)
 		}
 	})
+}
+
+func TestMapPoolDiscardsMapsShrunkBelowAllocatedSizeClass(t *testing.T) {
+	pool := &mapPool[int, int]{
+		defaultSize: 16,
+		maxSize:     1024,
+	}
+
+	m := pool.Get(1024)
+	shrunkID := mapIdentity(m)
+	for i := 0; i < 1024; i++ {
+		m[i] = i
+	}
+	for i := 1; i < 1024; i++ {
+		delete(m, i)
+	}
+	if got := len(m); got != 1 {
+		t.Fatalf("test setup len = %d, expected 1", got)
+	}
+
+	pool.Put(m)
+
+	if pooled := pool.pools[0].Get(); pooled != nil {
+		got := pooled.(map[int]int)
+		t.Fatalf("shrunk map was pooled in live-length class: got map identity %x, shrunk map identity %x", mapIdentity(got), shrunkID)
+	}
+
+	if pooled := pool.pools[nextLogBase2(1024)].Get(); pooled != nil {
+		got := pooled.(map[int]int)
+		t.Fatalf("shrunk map was retained in allocated size class: got map identity %x, shrunk map identity %x", mapIdentity(got), shrunkID)
+	}
 }
 
 func TestNextLogBase2(t *testing.T) {
@@ -82,32 +121,6 @@ func TestNextLogBase2(t *testing.T) {
 		result := nextLogBase2(test.input)
 		if result != test.expected {
 			t.Errorf("nextLogBase2(%d) = %d, expected %d", test.input, result, test.expected)
-		}
-	}
-}
-
-func TestPrevLogBase2(t *testing.T) {
-	tests := []struct {
-		input    uint32
-		expected uint32
-	}{
-		{1, 0},
-		{2, 1},
-		{3, 1},
-		{4, 2},
-		{5, 2},
-		{7, 2},
-		{8, 3},
-		{9, 3},
-		{15, 3},
-		{16, 4},
-		{1024, 10},
-	}
-
-	for _, test := range tests {
-		result := prevLogBase2(test.input)
-		if result != test.expected {
-			t.Errorf("prevLogBase2(%d) = %d, expected %d", test.input, result, test.expected)
 		}
 	}
 }

@@ -513,7 +513,11 @@ func (b *rawBridge) Create(cancel <-chan struct{}, input *fuse.CreateIn, name st
 	}
 	out.OpenFlags = flags
 
-	b.addBackingID(child, f, &out.OpenOut)
+	func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.addBackingID(child, f, &out.OpenOut)
+	}()
 	child.setEntryOut(&out.EntryOut)
 	b.setEntryOutTimeout(&out.EntryOut)
 	return fuse.OK
@@ -1274,11 +1278,13 @@ func (b *rawBridge) CopyFileRange(cancel <-chan struct{}, in *fuse.CopyFileRange
 	if !ok {
 		return 0, fuse.ENOTSUP
 	}
+	f1 := b.getFile(in.FhIn)
 
 	n2 := b.getNode(in.NodeIdOut)
+	f2 := b.getFile(in.FhOut)
 
 	sz, errno := cfr.CopyFileRange(&fuse.Context{Caller: in.Caller, Cancel: cancel},
-		b.files[in.FhIn].file, in.OffIn, n2, b.files[in.FhOut].file, in.OffOut, in.Len, in.Flags)
+		f1.file, in.OffIn, n2, f2.file, in.OffOut, in.Len, in.Flags)
 	return sz, errnoToStatus(errno)
 }
 
@@ -1306,13 +1312,14 @@ func (b *rawBridge) Lseek(cancel <-chan struct{}, in *fuse.LseekIn, out *fuse.Ls
 	ctx := &fuse.Context{Caller: in.Caller, Cancel: cancel}
 
 	ls, ok := n.ops.(NodeLseeker)
+	f := b.getFile(in.Fh)
 	if ok {
 		off, errno := ls.Lseek(ctx,
-			b.files[in.Fh].file, in.Offset, in.Whence)
+			f.file, in.Offset, in.Whence)
 		out.Offset = off
 		return errnoToStatus(errno)
 	}
-	if fs, ok := b.files[in.Fh].file.(FileLseeker); ok {
+	if fs, ok := f.file.(FileLseeker); ok {
 		off, errno := fs.Lseek(ctx, in.Offset, in.Whence)
 		out.Offset = off
 		return errnoToStatus(errno)
