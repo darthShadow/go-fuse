@@ -23,6 +23,13 @@ $GO_TEST ./...
 # The following tests need to run as root
 sudo env PATH=$PATH $GO_TEST -run 'Test(DirectMount|Forget|Passthrough|IDMappedMount)' ./fs ./fuse
 
+# Race detector on the concurrency-critical bridge package (Artifact A lock-free rework).
+# Skip the GOMAXPROCS=1 matrix leg: with a single P the detector observes almost no
+# goroutine interleaving, which is exactly what this gate must exercise.
+if [ "${GOMAXPROCS}" != "1" ]; then
+	$GO_TEST -race ./fs ./fuse
+fi
+
 # Run virtiofs tests (including posixtest inside a VM) if QEMU and KVM are available.
 # These are skipped automatically by TestMain when assets cannot be prepared.
 $GO_TEST -timeout 2m -run 'Test(Basic|Posixtest)' ./virtiofs

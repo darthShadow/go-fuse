@@ -347,11 +347,7 @@ func BenchmarkNodeMapCompaction(b *testing.B) {
 }
 
 func BenchmarkNodeMapShardOperations(b *testing.B) {
-	pool := &mapPool[uint64, *inode]{
-		defaultSize: defaultMapSize,
-		maxSize:     maxMapSize,
-	}
-	shard := &mapShard[uint64, *inode]{pool: pool}
+	shard := &mapShard[uint64, *inode]{}
 	node := &inode{}
 
 	b.Run("Set", func(b *testing.B) {

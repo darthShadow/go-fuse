@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -66,13 +67,19 @@ type Inode struct {
 	// Following data is mutable.
 
 	// file handles.
-	// protected by bridge.mu
+	// protected by rawBridge.fileMu
 	openFiles []uint32
 
-	// backing files, protected by bridge.mu
+	// backing files, protected by n.backingMu
+	backingMu         sync.Mutex
 	backingIDRefcount int
 	backingID         int32
 	backingFd         int
+
+	// localRefs counts bridge-local holders that resolved this node by node ID.
+	localRefs atomic.Int64
+	// retired reports whether this node's ID lives in retiredKernelNodeIds.
+	retired atomic.Bool
 
 	// mu protects the following mutable fields. When locking
 	// multiple Inodes, locks must be acquired using
@@ -430,14 +437,30 @@ func (n *Inode) removeRefInner(nlookup uint64, dropPersistence bool, inputUnused
 		n.changeCounter++
 	}
 
-	n.bridge.mu.Lock()
-	if n.lookupCount == 0 {
-		// Dropping the node from stableAttrs guarantees that no new references to this node are
-		// handed out to the kernel, hence we can also safely delete it from kernelNodeIds.
-		n.bridge._removeStableNode(n.stableAttr)
-		n.bridge._removeNode(n.nodeId)
+	if n.lookupCount == 0 && !n.retired.Load() {
+		// Drop the stable attr so no new kernel references are handed out, then retire the node id:
+		// insert into retiredKernelNodeIds BEFORE deleting from kernelNodeIds so a concurrent lock-free
+		// getNode always resolves the node in at least one map during the transition. The retired entry
+		// is reaped once localRefs drains (see acquireNode release + compactNodeMaps).
+		_, stableCandidate := n.bridge.stableAttrs.DeleteIf(n.stableAttr, func(got *Inode) bool {
+			return got == n
+		})
+		retiredCandidate := n.bridge.retiredKernelNodeIds.Set(n.nodeId, n)
+		deleted, liveCandidate := n.bridge.kernelNodeIds.DeleteIf(n.nodeId, func(got *Inode) bool {
+			return got == n
+		})
+		if deleted {
+			n.retired.Store(true)
+		} else {
+			_, undoCandidate := n.bridge.retiredKernelNodeIds.DeleteIf(n.nodeId, func(got *Inode) bool {
+				return got == n
+			})
+			retiredCandidate = retiredCandidate || undoCandidate
+		}
+		if stableCandidate || retiredCandidate || liveCandidate {
+			n.bridge.scheduleNodeMapCompaction()
+		}
 	}
-	n.bridge.mu.Unlock()
 
 retry:
 	for {

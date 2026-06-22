@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -283,4 +284,242 @@ func TestNegativeLookupCache(t *testing.T) {
 // NewNodeFS should not crash with opts=nil
 func TestNewNodeFSNilOpts(t *testing.T) {
 	NewNodeFS(&Inode{}, nil)
+}
+
+func TestNodeMapCompactorLifecycle(t *testing.T) {
+	bridge := NewNodeFS(&Inode{}, &Options{}).(*rawBridge)
+
+	doneClosed := func() bool {
+		select {
+		case <-bridge.compactDone:
+			return true
+		default:
+			return false
+		}
+	}
+
+	t.Run("worker initialized", func(t *testing.T) {
+		if bridge.compactWake == nil {
+			t.Fatal("compactWake is nil")
+		}
+		if bridge.compactStop == nil {
+			t.Fatal("compactStop is nil")
+		}
+		if bridge.compactDone == nil {
+			t.Fatal("compactDone is nil")
+		}
+		if doneClosed() {
+			t.Fatal("compactDone is closed before unmount")
+		}
+	})
+
+	bridge.scheduleNodeMapCompaction()
+
+	t.Run("unmount stops worker", func(t *testing.T) {
+		unmounted := make(chan struct{})
+		go func() {
+			defer close(unmounted)
+			bridge.OnUnmount()
+		}()
+
+		select {
+		case <-bridge.compactDone:
+		case <-time.After(time.Second):
+			t.Fatal("compactDone did not close within 1s after unmount")
+		}
+
+		select {
+		case <-unmounted:
+		case <-time.After(time.Second):
+			t.Fatal("OnUnmount did not return within 1s")
+		}
+	})
+
+	t.Run("second unmount is safe", func(t *testing.T) {
+		unmounted := make(chan struct{})
+		go func() {
+			defer close(unmounted)
+			bridge.OnUnmount()
+		}()
+
+		select {
+		case <-unmounted:
+		case <-time.After(time.Second):
+			t.Fatal("second OnUnmount did not return within 1s")
+		}
+
+		if !doneClosed() {
+			t.Fatal("compactDone is not closed after second unmount")
+		}
+	})
+}
+
+type bridgeFileHandleLookupCopyRaceRoot struct {
+	Inode
+
+	bridge *rawBridge
+	t      *testing.T
+}
+
+func (r *bridgeFileHandleLookupCopyRaceRoot) Open(ctx context.Context, flags uint32) (FileHandle, uint32, syscall.Errno) {
+	return &bridgeFileHandleLookupCopyRaceHandle{
+		bridge:       r.bridge,
+		t:            r.t,
+		lseekStarted: make(chan struct{}),
+	}, 0, OK
+}
+
+type bridgeFileHandleLookupCopyRaceHandle struct {
+	bridge *rawBridge
+	t      *testing.T
+
+	lseekOnce    sync.Once
+	lseekStarted chan struct{}
+}
+
+func (h *bridgeFileHandleLookupCopyRaceHandle) Lseek(ctx context.Context, off uint64, whence uint32) (uint64, syscall.Errno) {
+	h.lseekOnce.Do(func() {
+		close(h.lseekStarted)
+	})
+	h.checkFileMuAvailable("Lseek")
+	return off, OK
+}
+
+func (h *bridgeFileHandleLookupCopyRaceHandle) Release(ctx context.Context) syscall.Errno {
+	h.checkFileMuAvailable("Release")
+	return OK
+}
+
+func (h *bridgeFileHandleLookupCopyRaceHandle) checkFileMuAvailable(callback string) {
+	h.t.Helper()
+
+	locked := make(chan struct{})
+	go func() {
+		h.bridge.fileMu.Lock()
+		h.bridge.fileMu.Unlock()
+		close(locked)
+	}()
+
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		h.t.Errorf("%s callback could not acquire fileMu within %s", callback, time.Second)
+	}
+
+	select {
+	case <-time.After(time.Millisecond):
+	}
+}
+
+func TestBridgeFileHandleLookupCopyRace(t *testing.T) {
+	root := &bridgeFileHandleLookupCopyRaceRoot{
+		t: t,
+	}
+	bridge := NewNodeFS(root, nil).(*rawBridge)
+	root.bridge = bridge
+
+	const handles = 64
+	fhs := make([]uint64, handles)
+	handleFiles := make([]*bridgeFileHandleLookupCopyRaceHandle, handles)
+	for i := range fhs {
+		fhs[i], handleFiles[i] = mustOpenBridgeFileHandleLookupCopyRaceHandle(t, bridge)
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i, fh := range fhs {
+		handleFile := handleFiles[i]
+
+		wg.Add(1)
+		go func(fh uint64) {
+			defer wg.Done()
+			<-start
+
+			in := fuse.LseekIn{}
+			in.NodeId = 1
+			in.Fh = fh
+			var out fuse.LseekOut
+			if status := bridge.Lseek(nil, &in, &out); !status.Ok() {
+				t.Errorf("Lseek(%d) status = %v, want OK", fh, status)
+			}
+		}(fh)
+
+		wg.Add(1)
+		go func(fh uint64, handleFile *bridgeFileHandleLookupCopyRaceHandle) {
+			defer wg.Done()
+			<-start
+
+			select {
+			case <-handleFile.lseekStarted:
+			case <-time.After(time.Second):
+				t.Errorf("Lseek(%d) callback did not start within %s", fh, time.Second)
+				return
+			}
+
+			releaseBridgeFileHandleLookupCopyRaceHandle(bridge, fh)
+		}(fh, handleFile)
+	}
+
+	close(start)
+	waitBridgeFileHandleLookupCopyRaceGoroutines(t, &wg)
+
+	reopened := make([]uint64, handles)
+	for i := range reopened {
+		fh, _ := mustOpenBridgeFileHandleLookupCopyRaceHandle(t, bridge)
+		if fh == 0 {
+			t.Fatalf("reopened handle %d Fh = 0, want non-zero", i)
+		}
+		reopened[i] = fh
+	}
+	for _, fh := range reopened {
+		releaseBridgeFileHandleLookupCopyRaceHandle(bridge, fh)
+	}
+}
+
+func mustOpenBridgeFileHandleLookupCopyRaceHandle(t *testing.T, bridge *rawBridge) (uint64, *bridgeFileHandleLookupCopyRaceHandle) {
+	t.Helper()
+
+	in := fuse.OpenIn{}
+	in.NodeId = 1
+	var out fuse.OpenOut
+	if status := bridge.Open(nil, &in, &out); !status.Ok() {
+		t.Fatalf("Open status = %v, want OK", status)
+	}
+	if out.Fh == 0 {
+		t.Fatal("Open Fh = 0, want non-zero")
+	}
+
+	fe := bridge.getFile(out.Fh)
+	if fe == nil {
+		t.Fatalf("getFile(%d) = nil, want file entry", out.Fh)
+	}
+	handleFile, ok := fe.file.(*bridgeFileHandleLookupCopyRaceHandle)
+	if !ok {
+		t.Fatalf("getFile(%d).file = %T, want *bridgeFileHandleLookupCopyRaceHandle", out.Fh, fe.file)
+	}
+	return out.Fh, handleFile
+}
+
+func releaseBridgeFileHandleLookupCopyRaceHandle(bridge *rawBridge, fh uint64) {
+	in := fuse.ReleaseIn{
+		Fh: fh,
+	}
+	in.NodeId = 1
+	bridge.Release(nil, &in)
+}
+
+func waitBridgeFileHandleLookupCopyRaceGoroutines(t *testing.T, wg *sync.WaitGroup) {
+	t.Helper()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent Lseek/Release goroutines did not finish within 5s")
+	}
 }

@@ -5,6 +5,8 @@
 
 Go native bindings for the FUSE kernel module.
 
+Fork-specific performance divergences are documented in [docs/design/fork-perf/](docs/design/fork-perf/).
+
 Use
 [github.com/hanwen/go-fuse/v2/fs](https://godoc.org/github.com/hanwen/go-fuse/v2/fs)
 library.  It follows the wire protocol closely, but provides

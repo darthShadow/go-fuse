@@ -12,6 +12,8 @@ import (
 // requests. This is a convenience wrapper around NewNodeFS and
 // fuse.NewServer.  If nil is given as options, default settings are
 // applied, which are 1 second entry and attribute timeout.
+// Mount stops the NewNodeFS background compactor if server creation or mounting
+// fails before normal unmount.
 func Mount(dir string, root InodeEmbedder, options *Options) (*fuse.Server, error) {
 	rawFS := NewNodeFS(root, options)
 	var mountOptions *fuse.MountOptions
@@ -20,6 +22,7 @@ func Mount(dir string, root InodeEmbedder, options *Options) (*fuse.Server, erro
 	}
 	server, err := fuse.NewServer(rawFS, dir, mountOptions)
 	if err != nil {
+		rawFS.(*rawBridge).stopNodeMapCompactor()
 		return nil, err
 	}
 
@@ -27,6 +30,7 @@ func Mount(dir string, root InodeEmbedder, options *Options) (*fuse.Server, erro
 	if err := server.WaitMount(); err != nil {
 		// we don't shutdown the serve loop. If the mount does
 		// not succeed, the loop won't work and exit.
+		rawFS.(*rawBridge).stopNodeMapCompactor()
 		return nil, err
 	}
 

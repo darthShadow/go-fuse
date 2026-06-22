@@ -12,7 +12,7 @@ primary fork focus.
 |---|---|
 | [Cloned FUSE file descriptors](numclonefds.md) | `MountOptions.NumCloneFDs` opens additional Linux FUSE descriptors for the same mount session. |
 | [Sharded read-buffer pool](sharded-bytepool.md) | `Server.readPool` splits one retained-buffer budget across per-fd `bytePoolShard` instances. |
-| [Sharded bridge maps](sharded-bridge-maps.md) | `rawBridge.stableAttrs` and `rawBridge.kernelNodeIds` use `shardedMap` instead of plain Go maps. |
+| [Bridge concurrency and sharded maps](sharded-bridge-maps.md) | `rawBridge.stableAttrs`, `rawBridge.kernelNodeIds`, and `rawBridge.retiredKernelNodeIds` use `shardedMap`; file handles and passthrough backing state use scoped locks. |
 
 ## Splice Fallback
 
