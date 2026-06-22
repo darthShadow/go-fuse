@@ -17,3 +17,4 @@ example/zipfs/zipfs
 benchmark/bulkstat.bin
 benchmark/bulkstat/main
 benchmark/cstatfs
+benchmark/profiles/

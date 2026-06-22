@@ -147,9 +147,13 @@ func TestReturnRequestSaveBeforeClear(t *testing.T) {
 	if newReadBufCalls != 1 {
 		t.Errorf("readPool allocator calls after two Gets: got=%d want=1", newReadBufCalls)
 	}
-	gotReq := reqPool.Get().(*requestAlloc)
-	if gotReq != req {
-		t.Errorf("reqPool request: got=%p want=%p", gotReq, req)
+	// sync.Pool gives no retention guarantee: the GC (far more aggressive
+	// under -race) may drain it between Put and Get, so a drained Get returns
+	// nil. Tolerate that; the inflightRequestBytes==0 check above already
+	// proves putReq(req) ran. Only flag a non-nil pointer that isn't req.
+	got, _ := reqPool.Get().(*requestAlloc)
+	if got != nil && got != req {
+		t.Errorf("reqPool request: got=%p want=%p", got, req)
 	}
 }
 

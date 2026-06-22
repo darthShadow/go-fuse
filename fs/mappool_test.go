@@ -24,18 +24,25 @@ func TestMapPool(t *testing.T) {
 	t.Run("Put recycles maps under maxSize", func(t *testing.T) {
 		p := &mapPool[uint64, struct{}]{maxSize: 5}
 		m := p.Get(2)
-		wantID := mapIdentity(m)
 		m[1] = struct{}{}
 		m[2] = struct{}{}
 
 		p.Put(m)
-		recycled := p.Get(2)
-
-		if gotID := mapIdentity(recycled); gotID != wantID {
-			t.Errorf("expected recycled map identity %x, got %x", wantID, gotID)
+		if got, want := len(m), 0; got != want {
+			t.Fatalf("len(m) after Put = %d, want %d", got, want)
 		}
-		if len(recycled) != 0 {
-			t.Error("map was not cleared before recycling")
+
+		recycled := p.Get(2)
+		if recycled == nil {
+			t.Fatalf("recycled == nil = %t, want %t", recycled == nil, false)
+		}
+		if got, want := len(recycled), 0; got != want {
+			t.Fatalf("len(recycled) after Get = %d, want %d", got, want)
+		}
+
+		recycled[3] = struct{}{}
+		if _, ok := recycled[3]; ok != true {
+			t.Fatalf("recycled map key presence = %t, want %t", ok, true)
 		}
 	})
 

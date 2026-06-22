@@ -275,23 +275,9 @@ func (m *shardedMap[K, V]) compactCandidates(now time.Time) {
 }
 
 func (m *shardedMap[K, V]) Count() int32 {
-	var wg sync.WaitGroup
-	shards := m.shards[:]
-	counts := make([]int32, len(shards))
-	wg.Add(len(shards))
-
-	for i, shard := range shards {
-		go func(index int, s *mapShard[K, V]) {
-			defer wg.Done()
-			counts[index] = s.Count()
-		}(i, shard)
-	}
-
-	wg.Wait()
-
 	total := int32(0)
-	for _, count := range counts {
-		total += count
+	for _, shard := range m.shards {
+		total += shard.Count()
 	}
 	return total
 }

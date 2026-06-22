@@ -167,15 +167,15 @@ type bridgeConcurrencyNode struct {
 
 func TestBridgeForgetLookupMembershipCompaction(t *testing.T) {
 	t.Run("compaction not run", func(t *testing.T) {
-		bridge, node, stable, release := newForgottenBridgeConcurrencyNodeWithLocalRef(t, "no-compact", 7201)
-		defer release()
+		bridge, node, stable := newForgottenBridgeConcurrencyNodeWithLocalRef(t, "no-compact", 7201)
+		defer bridge.releaseNode(node)
 
 		assertBridgeRetiredMembership(t, bridge, node, stable, true)
 	})
 
 	t.Run("compaction run while local ref live", func(t *testing.T) {
-		bridge, node, stable, release := newForgottenBridgeConcurrencyNodeWithLocalRef(t, "compact-live", 7202)
-		defer release()
+		bridge, node, stable := newForgottenBridgeConcurrencyNodeWithLocalRef(t, "compact-live", 7202)
+		defer bridge.releaseNode(node)
 
 		bridge.compactNodeMaps(time.Now().Add(mapCompactMinInterval))
 
@@ -183,8 +183,8 @@ func TestBridgeForgetLookupMembershipCompaction(t *testing.T) {
 	})
 
 	t.Run("compaction run after local refs drain", func(t *testing.T) {
-		bridge, node, stable, release := newForgottenBridgeConcurrencyNodeWithLocalRef(t, "compact-drained", 7203)
-		release()
+		bridge, node, stable := newForgottenBridgeConcurrencyNodeWithLocalRef(t, "compact-drained", 7203)
+		bridge.releaseNode(node)
 
 		bridge.compactNodeMaps(time.Now().Add(mapCompactMinInterval))
 
@@ -201,7 +201,7 @@ func TestBridgeRetiredKernelNodeIDResolution(t *testing.T) {
 	compactWhileDrainAt := compactWhileReleaseAt.Add(mapCompactMinInterval)
 	compactAfterDrainAt := compactWhileDrainAt.Add(mapCompactMinInterval)
 
-	liveNode, releaseLive := bridge.acquireNode(node.nodeId)
+	liveNode := bridge.acquireNode(node.nodeId)
 	if liveNode != node {
 		t.Fatalf("acquireNode(%d) before Forget = %p, want %p", node.nodeId, liveNode, node)
 	}
@@ -213,8 +213,7 @@ func TestBridgeRetiredKernelNodeIDResolution(t *testing.T) {
 	}
 
 	type acquireResult struct {
-		node    *Inode
-		release func()
+		node *Inode
 	}
 
 	acquireStart := make(chan struct{})
@@ -224,8 +223,8 @@ func TestBridgeRetiredKernelNodeIDResolution(t *testing.T) {
 	go func() {
 		defer acquireWG.Done()
 		<-acquireStart
-		retiredNode, releaseRetired := bridge.acquireNode(node.nodeId)
-		acquired <- acquireResult{node: retiredNode, release: releaseRetired}
+		retiredNode := bridge.acquireNode(node.nodeId)
+		acquired <- acquireResult{node: retiredNode}
 	}()
 	go func() {
 		defer acquireWG.Done()
@@ -250,7 +249,7 @@ func TestBridgeRetiredKernelNodeIDResolution(t *testing.T) {
 	go func() {
 		defer releaseLiveWG.Done()
 		<-releaseLiveStart
-		releaseLive()
+		bridge.releaseNode(liveNode)
 	}()
 	go func() {
 		defer releaseLiveWG.Done()
@@ -273,7 +272,7 @@ func TestBridgeRetiredKernelNodeIDResolution(t *testing.T) {
 	go func() {
 		defer releaseRetiredWG.Done()
 		<-releaseRetiredStart
-		retired.release()
+		bridge.releaseNode(retired.node)
 		close(releasedRetired)
 	}()
 	go func() {
@@ -321,26 +320,26 @@ func TestBridgeRetiredKernelNodeIDResolution(t *testing.T) {
 	}
 	assertBridgeRetiredMembership(t, bridge, node, stable, false)
 
-	reapedNode, releaseReaped := bridge.acquireNode(node.nodeId)
-	releaseReaped()
+	reapedNode := bridge.acquireNode(node.nodeId)
+	bridge.releaseNode(reapedNode)
 	if reapedNode != nil {
 		t.Fatalf("acquireNode(%d) after reap = %p, want nil", node.nodeId, reapedNode)
 	}
 }
 
-func newForgottenBridgeConcurrencyNodeWithLocalRef(t *testing.T, name string, ino uint64) (*rawBridge, *Inode, StableAttr, func()) {
+func newForgottenBridgeConcurrencyNodeWithLocalRef(t *testing.T, name string, ino uint64) (*rawBridge, *Inode, StableAttr) {
 	t.Helper()
 
 	bridge := NewNodeFS(&Inode{}, nil).(*rawBridge)
 	stable := StableAttr{Mode: syscall.S_IFREG, Ino: ino, Gen: 1}
 	node := newBridgeConcurrencyNode(t, bridge, name, stable)
 
-	acquired, release := bridge.acquireNode(node.nodeId)
+	acquired := bridge.acquireNode(node.nodeId)
 	if acquired != node {
 		t.Fatalf("acquireNode(%d) = %p, want %p", node.nodeId, acquired, node)
 	}
 	bridge.Forget(node.nodeId, 1)
-	return bridge, node, stable, release
+	return bridge, node, stable
 }
 
 func newBridgeConcurrencyNode(t *testing.T, bridge *rawBridge, name string, stable StableAttr) *Inode {

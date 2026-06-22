@@ -254,23 +254,23 @@ func doGetXAttr(server *protocolServer, req *request) {
 		return
 	}
 
-	if server.opts.IgnoreSecurityLabels && req.inHeader().Opcode == _OP_GETXATTR {
-		fn := req.filename()
-		if fn == _SECURITY_CAPABILITY || fn == _SECURITY_ACL_DEFAULT ||
-			fn == _SECURITY_ACL {
-			req.status = ENOATTR
-			return
-		}
-	}
-
-	input := (*GetXAttrIn)(req.inData())
+	var input *GetXAttrIn
 	var n uint32
 	switch req.inHeader().Opcode {
 	case _OP_GETXATTR:
-		n, req.status = server.fileSystem.GetXAttr(req.cancel, req.inHeader(), req.filename(), req.outPayload)
+		name := req.filename()
+		if server.opts.IgnoreSecurityLabels && (name == _SECURITY_CAPABILITY ||
+			name == _SECURITY_ACL_DEFAULT || name == _SECURITY_ACL) {
+			req.status = ENOATTR
+			return
+		}
+		input = (*GetXAttrIn)(req.inData())
+		n, req.status = server.fileSystem.GetXAttr(req.cancel, req.inHeader(), name, req.outPayload)
 	case _OP_LISTXATTR:
+		input = (*GetXAttrIn)(req.inData())
 		n, req.status = server.fileSystem.ListXAttr(req.cancel, req.inHeader(), req.outPayload)
 	default:
+		input = (*GetXAttrIn)(req.inData())
 		req.status = ENOSYS
 	}
 

@@ -5,11 +5,12 @@
 package fs
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log"
 	"math/rand"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -199,8 +200,8 @@ func (n *Inode) String() string {
 // See lockNodes where this property is used to avoid deadlock when taking
 // locks on inode group.
 func sortNodes(ns []*Inode) {
-	sort.Slice(ns, func(i, j int) bool {
-		return nodeLess(ns[i], ns[j])
+	slices.SortFunc(ns, func(a, b *Inode) int {
+		return cmp.Compare(uintptr(unsafe.Pointer(a)), uintptr(unsafe.Pointer(b)))
 	})
 }
 

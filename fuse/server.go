@@ -652,19 +652,31 @@ func (ms *protocolServer) notifyWrite(req *request) Status {
 	return Status(errno)
 }
 
+func notifyStatus(opcode uint32) Status {
+	switch opcode {
+	case _OP_NOTIFY_INVAL_INODE:
+		return NOTIFY_INVAL_INODE
+	case _OP_NOTIFY_INVAL_ENTRY:
+		return NOTIFY_INVAL_ENTRY
+	case _OP_NOTIFY_STORE_CACHE:
+		return NOTIFY_STORE_CACHE
+	case _OP_NOTIFY_RETRIEVE_CACHE:
+		return NOTIFY_RETRIEVE_CACHE
+	case _OP_NOTIFY_DELETE:
+		return NOTIFY_DELETE
+	case _OP_NOTIFY_PRUNE:
+		return NOTIFY_PRUNE
+	default:
+		return 0
+	}
+}
+
 func newNotifyRequest(opcode uint32) *request {
 	r := &request{
 		inputBuf:     make([]byte, unsafe.Sizeof(InHeader{})),
 		outHeaderBuf: make([]byte, sizeOfOutHeader),
 		outDataBuf:   make([]byte, getHandler(opcode).OutputSize),
-		status: map[uint32]Status{
-			_OP_NOTIFY_INVAL_INODE:    NOTIFY_INVAL_INODE,
-			_OP_NOTIFY_INVAL_ENTRY:    NOTIFY_INVAL_ENTRY,
-			_OP_NOTIFY_STORE_CACHE:    NOTIFY_STORE_CACHE,
-			_OP_NOTIFY_RETRIEVE_CACHE: NOTIFY_RETRIEVE_CACHE,
-			_OP_NOTIFY_DELETE:         NOTIFY_DELETE,
-			_OP_NOTIFY_PRUNE:          NOTIFY_PRUNE,
-		}[opcode],
+		status:       notifyStatus(opcode),
 	}
 	r.inHeader().Opcode = opcode
 	return r
