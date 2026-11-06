@@ -5,47 +5,36 @@
 package fuse
 
 import (
+	"math/bits"
 	"os"
 	"sync"
+	"unsafe"
 )
+
+// numBufferClasses covers every uint32 size at 4 KiB pages.
+const numBufferClasses = 76
 
 // bufferPool implements explicit memory management. It is used for
 // minimizing the GC overhead of communicating with the kernel.
 type bufferPool struct {
-	lock sync.Mutex
-
-	// For each page size multiple a list of slice pointers.
-	buffersBySize []*sync.Pool
-
-	// Number of outstanding allocations. Used for testing.
-	countersBySize []int
+	// pools[i] holds *byte pointing at buffers of the i-th size
+	// class. A pointer, unlike a slice, goes into a sync.Pool
+	// without allocating.
+	pools [numBufferClasses]sync.Pool
 }
 
 var pageSize = os.Getpagesize()
 
-func (p *bufferPool) counters() []int {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	d := make([]int, len(p.countersBySize))
-	copy(d, p.countersBySize)
-	return d
-}
-
-func (p *bufferPool) getPool(pageCount int, delta int) *sync.Pool {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	for len(p.buffersBySize) <= pageCount {
-		p.buffersBySize = append(p.buffersBySize, nil)
-		p.countersBySize = append(p.countersBySize, 0)
+// sizeClass rounds a page count up to its size class: exact up to 4
+// pages, then 4 classes per doubling (5, 6, 7, 8, 10, 12, 14, 16, 20,
+// ...), so a buffer is less than 25% larger than requested.
+func sizeClass(pages int) (idx, classPages int) {
+	if pages <= 4 {
+		return pages - 1, pages
 	}
-	if p.buffersBySize[pageCount] == nil {
-		p.buffersBySize[pageCount] = &sync.Pool{
-			New: func() any { return make([]byte, pageSize*pageCount) },
-		}
-	}
-	p.countersBySize[pageCount] += delta
-	return p.buffersBySize[pageCount]
+	shift := bits.Len(uint(pages-1)) - 3
+	q := (pages-1)>>shift + 1
+	return 4*shift + q - 1, q << shift
 }
 
 // AllocBuffer creates a buffer of at least the given size. After use,
@@ -56,24 +45,27 @@ func (p *bufferPool) AllocBuffer(size uint32) []byte {
 	if sz%pageSize != 0 {
 		sz += pageSize
 	}
-	pages := sz / pageSize
-
-	b := p.getPool(pages, 1).Get().([]byte)
-	return b[:size]
+	idx, classPages := sizeClass(sz / pageSize)
+	n := classPages * pageSize
+	if b, ok := p.pools[idx].Get().(*byte); ok {
+		return unsafe.Slice(b, n)[:size]
+	}
+	return make([]byte, size, n)
 }
 
 // FreeBuffer takes back a buffer if it was allocated through
 // AllocBuffer.  It is not an error to call FreeBuffer() on a slice
 // obtained elsewhere.
 func (p *bufferPool) FreeBuffer(slice []byte) {
-	if slice == nil {
-		return
-	}
 	if cap(slice)%pageSize != 0 || cap(slice) == 0 {
 		return
 	}
 	pages := cap(slice) / pageSize
-	slice = slice[:cap(slice)]
-
-	p.getPool(pages, -1).Put(slice)
+	// AllocBuffer hands out the full class size, so only a slice
+	// whose capacity is exactly a class size can go back.
+	idx, classPages := sizeClass(pages)
+	if classPages != pages || idx >= len(p.pools) {
+		return
+	}
+	p.pools[idx].Put(unsafe.SliceData(slice))
 }
