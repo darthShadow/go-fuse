@@ -406,7 +406,7 @@ func (b *rawBridge) Lookup(ctx context.Context, header *fuse.InHeader, name stri
 		return b.lookupDotDot(ctx, header.NodeId, out)
 	}
 	parent, _ := b.inode(header.NodeId, 0)
-	child, errno := b.lookup(ctx, parent, name, out, &fuse.AttrOut{})
+	child, errno := b.lookup(ctx, parent, name, out, nil)
 
 	if errno != 0 {
 		if errno == syscall.ENOENT && b.options.NegativeTimeout != nil && out.EntryTimeout() == 0 {
@@ -492,7 +492,7 @@ func (b *rawBridge) lookupDotDot(ctx context.Context, nodeID uint64, out *fuse.E
 	return fuse.OK
 }
 
-// lookup uses attr as scratch space for Getattr.
+// lookup uses attr as scratch space for Getattr. A nil attr is allocated only when Getattr runs.
 func (b *rawBridge) lookup(ctx context.Context, parent *Inode, name string, out *fuse.EntryOut, attr *fuse.AttrOut) (*Inode, syscall.Errno) {
 	if lu, ok := parent.ops.(NodeLookuper); ok {
 		return lu.Lookup(ctx, name, out)
@@ -504,7 +504,11 @@ func (b *rawBridge) lookup(ctx context.Context, parent *Inode, name string, out 
 	}
 
 	if ga, ok := child.ops.(NodeGetattrer); ok {
-		*attr = fuse.AttrOut{}
+		if attr == nil {
+			attr = &fuse.AttrOut{}
+		} else {
+			*attr = fuse.AttrOut{}
+		}
 		errno := ga.Getattr(ctx, nil, attr)
 		if errno == 0 {
 			out.Attr = attr.Attr
@@ -1131,8 +1135,10 @@ func (b *rawBridge) OpenDir(ctx context.Context, input *fuse.OpenIn, out *fuse.O
 		fh = &dirStreamAsFile{creator: ctor}
 	}
 
-	if fuseFlags&(fuse.FOPEN_CACHE_DIR|fuse.FOPEN_KEEP_CACHE) != 0 {
-		fuseFlags |= fuse.FOPEN_CACHE_DIR | fuse.FOPEN_KEEP_CACHE
+	// FOPEN_KEEP_CACHE alone keeps the kernel's cached entries without
+	// reading or filling the cache, so it is passed through as is.
+	if fuseFlags&fuse.FOPEN_CACHE_DIR != 0 {
+		fuseFlags |= fuse.FOPEN_KEEP_CACHE
 	}
 	fe := b.ids.registerFile(e, fh, 0)
 	out.Fh = uint64(fe.fh)
@@ -1217,7 +1223,13 @@ func (b *rawBridge) readDirMaybeLookup(ctx context.Context, input *fuse.ReadIn, 
 
 	first := true
 	f.lastRead = f.lastRead[:0]
-	var attr fuse.AttrOut
+	fileLookuper, _ := f.file.(FileLookuper)
+	// Scratch space for b.lookup. It escapes, so allocate it only
+	// when the Node lookup fallback can run.
+	var attr *fuse.AttrOut
+	if lookup && fileLookuper == nil {
+		attr = &fuse.AttrOut{}
+	}
 	for {
 		var de *fuse.DirEntry
 		var errno syscall.Errno
@@ -1279,10 +1291,10 @@ func (b *rawBridge) readDirMaybeLookup(ctx context.Context, input *fuse.ReadIn, 
 		}
 
 		var child *Inode
-		if fileLookupper, ok := f.file.(FileLookuper); ok {
-			child, errno = fileLookupper.Lookup(ctx, e.Name, entryOut)
+		if fileLookuper != nil {
+			child, errno = fileLookuper.Lookup(ctx, e.Name, entryOut)
 		} else {
-			child, errno = b.lookup(ctx, n, e.Name, entryOut, &attr)
+			child, errno = b.lookup(ctx, n, e.Name, entryOut, attr)
 		}
 
 		if errno != 0 {
