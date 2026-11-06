@@ -16,20 +16,20 @@ type latencyMapEntry struct {
 
 type LatencyMap struct {
 	sync.Mutex
-	stats map[string]*latencyMapEntry
+	stats map[string]latencyMapEntry
 }
 
 func NewLatencyMap() *LatencyMap {
 	m := &LatencyMap{}
-	m.stats = make(map[string]*latencyMapEntry)
+	m.stats = make(map[string]latencyMapEntry)
 	return m
 }
 
 func (m *LatencyMap) Get(name string) (count int, dt time.Duration) {
 	m.Mutex.Lock()
-	l := m.stats[name]
+	l, ok := m.stats[name]
 	m.Mutex.Unlock()
-	if l == nil {
+	if !ok {
 		return 0, 0
 	}
 
@@ -39,18 +39,15 @@ func (m *LatencyMap) Get(name string) (count int, dt time.Duration) {
 func (m *LatencyMap) Add(name string, dt time.Duration) {
 	m.Mutex.Lock()
 	e := m.stats[name]
-	if e == nil {
-		e = new(latencyMapEntry)
-		m.stats[name] = e
-	}
 	e.count++
 	e.dur += dt
+	m.stats[name] = e
 	m.Mutex.Unlock()
 }
 
 func (m *LatencyMap) Counts() map[string]int {
-	r := make(map[string]int)
 	m.Mutex.Lock()
+	r := make(map[string]int, len(m.stats))
 	for k, v := range m.stats {
 		r[k] = v.count
 	}

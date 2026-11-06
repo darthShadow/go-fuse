@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -16,6 +17,40 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
+
+func TestNewInodeConcurrentSameEmbedder(t *testing.T) {
+	bridge := NewNodeFS(&Inode{}, nil).(*rawBridge)
+	ops := &Inode{}
+	before := bridge.ids.allocateNodeID()
+	const callers = 32
+	var nodes [callers]*Inode
+	var nodeIDs [callers]uint64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			nodes[i] = bridge.root.NewInode(context.Background(), ops, StableAttr{Mode: syscall.S_IFREG})
+			nodeIDs[i] = nodes[i].nodeId
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	after := bridge.ids.allocateNodeID()
+	for i := 0; i < callers; i++ {
+		if nodes[i] != ops.embed() {
+			t.Errorf("caller %d returned %p, want %p", i, nodes[i], ops.embed())
+		}
+		if nodeIDs[i] != nodeIDs[0] {
+			t.Errorf("caller %d saw nodeId %d, want %d", i, nodeIDs[i], nodeIDs[0])
+		}
+	}
+	if got := after - before; got != 2 {
+		t.Errorf("node ID allocation delta = %d, want 2", got)
+	}
+}
 
 // TestTypeChange simulates inode number reuse that happens on real
 // filesystems. For go-fuse, inode number reuse can look like a file changing

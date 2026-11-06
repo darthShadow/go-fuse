@@ -145,6 +145,9 @@ func (b *rawBridge) newInodeUnlocked(ops InodeEmbedder, id StableAttr, persisten
 		log.Panicf("using reserved ID %d for inode number", id.Ino)
 	}
 
+	ops.embed().mu.Lock()
+	defer ops.embed().mu.Unlock()
+
 	// This ops already was populated. Just return it.
 	if ops.embed().bridge != nil {
 		return ops.embed()
