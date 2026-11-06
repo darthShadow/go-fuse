@@ -54,6 +54,9 @@ type request struct {
 	// Unstructured output. Only one of outPayload and readResult is non-nil.
 	outPayload []byte
 	readResult ReadResult
+
+	// Output builder for READDIR and READDIRPLUS.
+	dirList DirEntryList
 }
 
 // requestAlloc holds the request, plus I/O buffers, which are
@@ -107,6 +110,7 @@ func (r *request) clear() {
 	r.outPayload = nil
 	r.readResult = nil
 	r.ctx = nil
+	r.dirList = DirEntryList{}
 }
 
 func (r *request) finish() {

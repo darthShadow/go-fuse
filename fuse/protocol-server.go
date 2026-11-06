@@ -39,10 +39,18 @@ type protocolServer struct {
 }
 
 func (ms *protocolServer) handleRequest(h *operationHandler, req *request) {
-	req.ctx = newRequestContext(req)
-	ms.addInflight(req)
+	// FORGET and BATCH_FORGET pass no context and have no reply,
+	// so there is nothing to interrupt.
+	op := req.inHeader().Opcode
+	tracked := op != _OP_FORGET && op != _OP_BATCH_FORGET
+	if tracked {
+		req.ctx = newRequestContext(req)
+		ms.addInflight(req)
+	}
 	defer func() {
-		ms.dropInflight(req)
+		if tracked {
+			ms.dropInflight(req)
+		}
 		req.finish()
 	}()
 

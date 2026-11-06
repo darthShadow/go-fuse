@@ -208,7 +208,8 @@ func doTmpfile(server *protocolServer, req *request) {
 
 func doReadDir(server *protocolServer, req *request) {
 	in := (*ReadIn)(req.inData())
-	out := NewDirEntryList(req.outPayload, uint64(in.Offset))
+	out := &req.dirList
+	out.reset(req.outPayload, uint64(in.Offset))
 	code := server.fileSystem.ReadDir(req.ctx, in, out)
 	req.outPayload = out.Bytes()
 	req.status = code
@@ -216,7 +217,8 @@ func doReadDir(server *protocolServer, req *request) {
 
 func doReadDirPlus(server *protocolServer, req *request) {
 	in := (*ReadIn)(req.inData())
-	out := NewDirEntryList(req.outPayload, uint64(in.Offset))
+	out := &req.dirList
+	out.reset(req.outPayload, uint64(in.Offset))
 
 	code := server.fileSystem.ReadDirPlus(req.ctx, in, out)
 	req.outPayload = out.Bytes()

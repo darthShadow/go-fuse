@@ -87,7 +87,13 @@ func (l *DirEntryList) setReaddirPlus(plus bool) {
 // NewDirEntryList creates a DirEntryList with the given data buffer
 // and offset.
 func NewDirEntryList(data []byte, off uint64) *DirEntryList {
-	return &DirEntryList{
+	l := &DirEntryList{}
+	l.reset(data, off)
+	return l
+}
+
+func (l *DirEntryList) reset(data []byte, off uint64) {
+	*l = DirEntryList{
 		buf:    data[:0],
 		size:   len(data),
 		Offset: off,
