@@ -9,6 +9,8 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"time"
+	"unsafe"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -16,6 +18,7 @@ import (
 // nodeEntry is the per-nodeid state the kernel-facing tables need
 // beyond the *Inode itself: which file handles are open on it, and (if
 // passthrough is in use) its backing-fd state.
+// Identity state is guarded by the shard that holds the nodeid.
 //
 // A nodeEntry lives for exactly as long as its nodeid is registered:
 // mapIdentityTable.forget deletes it in the same step that drops the
@@ -28,83 +31,145 @@ type nodeEntry struct {
 	// inode is the *Inode currently registered under this nodeid.
 	inode atomic.Pointer[Inode]
 
-	// lookupCount is the kernel's outstanding lookup
-	// count for this nodeid.
+	// lookupCount is the kernel's outstanding lookup count for this
+	// nodeid, guarded by its identity shard's mutex.
 	lookupCount uint64
 
-	// file handles open on this node.
+	// File handles open on this node, protected by mapIdentityTable.filesMu.
 	openFiles []uint32
+	// openCount mirrors len(openFiles); updates hold mapIdentityTable.filesMu.
+	openCount atomic.Int32
 
-	// backing-fd (passthrough) state. Protected by rawBridge.backingMu,
-	// not by mapIdentityTable.mu: addBackingID/releaseBackingIDRef
-	// (bridge.go) hold a lock across a call into the kernel to
-	// register/unregister the backing fd, and mu - used for identity
-	// resolution across the whole filesystem - must not be held during
-	// that call. Callers reach these fields via the *nodeEntry returned
-	// by the identity lookups below.
+	// backingMu protects the backing-fd state and each open file's
+	// backingIDRef. It is never held with an identity shard or filesMu.
+	// Inode locks precede backingMu; registration and unregistration run
+	// under it without blocking backing operations on other nodes.
+	backingMu         sync.Mutex
 	backingID         int32
 	backingIDRefcount int
+}
+
+const (
+	identityShardBits = 7
+	identityShards    = 1 << identityShardBits
+)
+
+type identityShardFields struct {
+	mu              sync.Mutex
+	stableAttrs     map[StableAttr]*Inode
+	nodes           map[uint64]*nodeEntry
+	stableAttrsHigh int
+	nodesHigh       int
+}
+
+// identityShard pads its fields to a multiple of 128 bytes, so that
+// two shard locks never share a cache line.
+type identityShard struct {
+	identityShardFields
+	_ [(128 - unsafe.Sizeof(identityShardFields{})%128) % 128]byte
 }
 
 // mapIdentityTable owns every kernel-facing number: nodeids and file
 // handles, and the mappings back to the entries they identify. It is
 // held by value as rawBridge.ids (see bridge.go).
 //
-// All methods lock internally (via mu) and return with no locks held.
-// Every method may be called while the caller already holds one or
-// more Inode.mu locks (via lockNodes/lockNode2) or a fileEntry.mu, but
-// never the reverse: no method here calls back into code that acquires
-// Inode.mu or fileEntry.mu while mu is held. This keeps mu innermost,
-// consistent with the package's existing rule that "locks for inodes
-// must be taken before rawBridge's locks".
+// Methods lock internally and return with no locks held. Identity maps
+// use 128 shards. In default mode, nodeids use the lower half and stable
+// keys the upper half. Under ExternalNodeID, both keys use the same shard
+// except for the root. Each map has its own high-water mark per shard.
+//
+// Lock order is fileEntry.mu, then Inode.mu, then one of identity shards,
+// filesMu, or nodeEntry.backingMu. These three inner groups never nest.
+// Two shards are held only through lockPair, in ascending index order.
+// No Node or File method runs under a table lock.
 type mapIdentityTable struct {
-	mu sync.Mutex
-
-	// stableAttrs is used to detect already-known nodes and hard links,
-	// keyed by dedupKey(id) - which is id itself (Mode, Ino and Gen all
-	// significant) unless externalNodeID is set, in which case it is id
-	// with Mode and Gen flattened out, leaving only Ino. See dedupKey.
-	stableAttrs  map[StableAttr]*Inode
-	automaticIno uint64
+	shards [identityShards]identityShard
 
 	// externalNodeID mirrors Options.ExternalNodeID: under it, nodeid
 	// == Ino
 	externalNodeID bool
 
-	// The *Node ID* is an arbitrary uint64 identifier chosen by the FUSE
-	// library. It is used to identify *nodes* (files/directories/symlinks/...)
-	// in the communication between the FUSE library and the Linux kernel.
-	//
-	// nodes translates between the NodeID and its nodeEntry. A simple
-	// incrementing counter is used as the NodeID (see nextNodeId).
-	nodes      map[uint64]*nodeEntry
-	nextNodeId uint64
+	// Atomic counters preserve the allocation sequence without a shard lock.
+	automaticIno atomic.Uint64
+	nextNodeId   atomic.Uint64
+	// freePending is set by the shard rebuild that arms the delayed
+	// FreeOSMemory, and cleared by that call.
+	freePending atomic.Bool
 
-	// nodeCountHigh records the highest number of entries we had in the
-	// nodes map. As the size of stableAttrs tracks nodes (+- a few
-	// entries due to concurrent FORGETs, LOOKUPs, and the fixed NodeID
-	// 1), this is also a good estimate for stableAttrs.
-	nodeCountHigh int
-
-	// files[fh] is nil if fh is free. files[0] is a dummy.
+	// filesMu protects files, freeFiles, nodeEntry.openFiles, and fileEntry.nodeIndex.
+	filesMu sync.Mutex
+	// files[fh] is nil if fh is free. files[0] is the immutable noFile placeholder.
 	files []*fileEntry
 	// indices of files that are not allocated.
 	freeFiles []uint32
+	// noFile is set once during initialization and read without filesMu.
+	noFile *fileEntry
 }
+
+var (
+	freeOSMemory      = debug.FreeOSMemory // test seam
+	identityAfterFunc = time.AfterFunc     // test seam
+)
+
+const freeOSMemoryDelay = 10 * time.Second
 
 // initIdentityTable prepares a zero-value mapIdentityTable for use.
 // The pointer receiver ensures the embedding rawBridge - and its
-// mutex - is never copied.
+// mutexes - is never copied.
 func (t *mapIdentityTable) initIdentityTable(firstAutomaticIno uint64, externalNodeID bool) {
-	t.automaticIno = firstAutomaticIno
-	if t.automaticIno == 0 {
-		t.automaticIno = 1 << 63
+	if firstAutomaticIno == 0 {
+		firstAutomaticIno = 1 << 63
 	}
+	t.automaticIno.Store(firstAutomaticIno)
 	t.externalNodeID = externalNodeID
-	t.stableAttrs = make(map[StableAttr]*Inode)
-	t.nodes = make(map[uint64]*nodeEntry)
+	for i := range t.shards {
+		t.shards[i].stableAttrs = make(map[StableAttr]*Inode)
+		t.shards[i].nodes = make(map[uint64]*nodeEntry)
+	}
 	// Fh 0 means no file handle.
 	t.files = []*fileEntry{{}}
+	t.noFile = t.files[0]
+}
+
+func shardIndex(x uint64, bits uint) int {
+	return int((x * 0x9E3779B97F4A7C15) >> (64 - bits))
+}
+
+func (t *mapIdentityTable) stableShard(ino uint64) int {
+	if t.externalNodeID {
+		return shardIndex(ino, identityShardBits)
+	}
+	return identityShards/2 + shardIndex(ino, identityShardBits-1)
+}
+
+func (t *mapIdentityTable) nodeShard(nodeID uint64) int {
+	if t.externalNodeID {
+		return shardIndex(nodeID, identityShardBits)
+	}
+	return shardIndex(nodeID, identityShardBits-1)
+}
+
+func (t *mapIdentityTable) lockPair(ino, nodeID uint64) (a, n *identityShard) {
+	i, j := t.stableShard(ino), t.nodeShard(nodeID)
+	a, n = &t.shards[i], &t.shards[j]
+	switch {
+	case i == j:
+		a.mu.Lock()
+	case i < j:
+		a.mu.Lock()
+		n.mu.Lock()
+	default:
+		n.mu.Lock()
+		a.mu.Lock()
+	}
+	return a, n
+}
+
+func unlockPair(a, n *identityShard) {
+	if a != n {
+		n.mu.Unlock()
+	}
+	a.mu.Unlock()
 }
 
 // dedupKey returns the key under which id is looked up/stored in
@@ -117,67 +182,62 @@ func (t *mapIdentityTable) dedupKey(id StableAttr) StableAttr {
 }
 
 func (t *mapIdentityTable) registerRoot(root *Inode) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	s := &t.shards[t.nodeShard(1)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	e := &nodeEntry{lookupCount: 1}
 	e.inode.Store(root)
-	t.nodes[1] = e
-	t.nextNodeId = 2 // the root node has nodeid 1
+	s.nodes[1] = e
+	t.nextNodeId.Store(2) // the root node has nodeid 1
 }
 
 func (t *mapIdentityTable) nextAutomaticIno() uint64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	ino := t.automaticIno
-	t.automaticIno++
-	return ino
+	return t.automaticIno.Add(1) - 1
 }
 
 func (t *mapIdentityTable) allocateNodeID() uint64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	id := t.nextNodeId
-	t.nextNodeId++
-	return id
+	return t.nextNodeId.Add(1) - 1
 }
 
 func (t *mapIdentityTable) findByAttr(id StableAttr) *Inode {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.stableAttrs[t.dedupKey(id)]
+	key := t.dedupKey(id)
+	s := &t.shards[t.stableShard(key.Ino)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stableAttrs[key]
 }
 
 // registerNew tries to register `child` under `id`. The following results are possible:
 // * winner == child: normal case
-// * winner == other node: racy lookup, retry call with the winner
+// * winner == other node: racy lookup, retry call with the winner; no entry returned
 //
 // If `evicted` is returned, its bookkeeping must be updated must be under lock.
 func (t *mapIdentityTable) registerNew(id StableAttr, child *Inode, exclusive bool) (winner *Inode, e *nodeEntry, evicted *Inode) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	key := t.dedupKey(id)
-	prev := t.stableAttrs[key]
+	a, n := t.lockPair(key.Ino, child.nodeId)
+	defer unlockPair(a, n)
+
+	prev := a.stableAttrs[key]
 	if !exclusive {
 		if prev != nil && prev != child && prev.stableAttr == id {
 			// Exact same identity found via a racing lookup (eg. two
 			// dirs linking to the same file, both losing to the same
-			// winner). We don't hold its lock, so we can't change it
-			return prev, t.nodes[prev.nodeId], nil
+			// winner). We don't hold its lock, so we can't change it.
+			// The caller discards e here; prev's nodeid may be in
+			// a shard whose lock we do not hold.
+			return prev, nil, nil
 		}
 	}
 
-	e = t.nodes[child.nodeId]
+	e = n.nodes[child.nodeId]
 	if e == nil {
 		// Fresh node: create its entry. If child was already
 		// registered (the old == child case above), its entry - and
 		// any accumulated openFiles/backing state - is left alone.
 		e = &nodeEntry{}
 		e.inode.Store(child)
-		t.nodes[child.nodeId] = e
-		if len(t.nodes) > t.nodeCountHigh {
-			t.nodeCountHigh = len(t.nodes)
-		}
+		n.nodes[child.nodeId] = e
+		n.nodesHigh = max(n.nodesHigh, len(n.nodes))
 	} else if old := e.inode.Load(); old != child {
 		// we must have a different StableAttr now.
 		evicted = old
@@ -185,7 +245,8 @@ func (t *mapIdentityTable) registerNew(id StableAttr, child *Inode, exclusive bo
 	}
 	// Any node that might be there is overwritten - it is obsolete now.
 	if prev != child {
-		t.stableAttrs[key] = child
+		a.stableAttrs[key] = child
+		a.stableAttrsHigh = max(a.stableAttrsHigh, len(a.stableAttrs))
 	}
 
 	// child is kept as the definitive occupant of id/child.nodeId from
@@ -207,9 +268,10 @@ func (t *mapIdentityTable) registerNew(id StableAttr, child *Inode, exclusive bo
 // under that lock too), or a LOOKUP racing with a FORGET can leave the
 // kernel holding a nodeid we already dropped.
 func (t *mapIdentityTable) decLookup(nodeID uint64, nlookup uint64) (n *Inode, reachedZero bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	e := t.nodes[nodeID]
+	s := &t.shards[t.nodeShard(nodeID)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.nodes[nodeID]
 	if e == nil {
 		log.Panicf("decLookup: unknown node %d", nodeID)
 	}
@@ -220,69 +282,79 @@ func (t *mapIdentityTable) decLookup(nodeID uint64, nlookup uint64) (n *Inode, r
 	return e.inode.Load(), e.lookupCount == 0
 }
 
-// node resolves a (nodeid, fh) pair as sent by the kernel. fh may be 0,
-// in which case the returned *fileEntry is the always-present
-// placeholder entry for "no file handle".
-func (t *mapIdentityTable) node(nodeID uint64, fh uint64) (*nodeEntry, *fileEntry) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.nodes[nodeID], t.files[fh]
+// node resolves a nodeid as sent by the kernel.
+func (t *mapIdentityTable) node(nodeID uint64) *nodeEntry {
+	s := &t.shards[t.nodeShard(nodeID)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nodes[nodeID]
 }
 
+// file returns the entry for fh, or the immutable placeholder for fh 0.
+func (t *mapIdentityTable) file(fh uint64) *fileEntry {
+	if fh == 0 {
+		return t.noFile
+	}
+	t.filesMu.Lock()
+	defer t.filesMu.Unlock()
+	return t.files[fh]
+}
+
+// forget deletes only keys still owned by n; nodeid deletion is independent
+// of stable-key ownership. Each map rebuilds after a 100x shrink to return
+// retained map storage (https://github.com/golang/go/issues/20135).
 func (t *mapIdentityTable) forget(n *Inode) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	key := t.dedupKey(n.stableAttr)
-	stillCurrent := t.stableAttrs[key] == n
-	if stillCurrent {
-		delete(t.stableAttrs, key)
+	a, s := t.lockPair(key.Ino, n.nodeId)
+	defer unlockPair(a, s)
+	if a.stableAttrs[key] == n {
+		delete(a.stableAttrs, key)
+		if a.stableAttrsHigh > max(len(a.stableAttrs), 1)*100 {
+			a.stableAttrs = rebuildMap(a.stableAttrs)
+			a.stableAttrsHigh = len(a.stableAttrs)
+			t.noteRebuild()
+		}
 	}
-	if e, ok := t.nodes[n.nodeId]; ok && e.inode.Load() == n && stillCurrent {
-		delete(t.nodes, n.nodeId)
+	// n occupies its nodeid without a kernel reference, so the
+	// nodeid's lookup count is zero.
+	if e, ok := s.nodes[n.nodeId]; ok && e.inode.Load() == n {
+		delete(s.nodes, n.nodeId)
+		if s.nodesHigh > max(len(s.nodes), 1)*100 {
+			s.nodes = rebuildMap(s.nodes)
+			s.nodesHigh = len(s.nodes)
+			t.noteRebuild()
+		}
 	}
 }
 
-// compact tries to free memory that was previously used by forgotten
-// nodes.
-//
-// Maps do not free all memory when elements get deleted
-// ( https://github.com/golang/go/issues/20135 ).
-// As a workaround, we recreate our two big maps (stableAttrs & nodes)
-// every time they have shrunk dramatically (100 x smaller).
-// In this case, `nodeCountHigh` is reset to the new (smaller) size.
-func (t *mapIdentityTable) compact() {
-	t.mu.Lock()
+func rebuildMap[K comparable, V any](m map[K]V) map[K]V {
+	r := make(map[K]V, len(m))
+	for k, v := range m {
+		r[k] = v
+	}
+	return r
+}
 
-	if t.nodeCountHigh <= len(t.nodes)*100 {
-		t.mu.Unlock()
+// noteRebuild arms one delayed FreeOSMemory for a burst of shard
+// rebuilds. It runs under shard locks; the timer callback runs
+// on its own goroutine and takes no lock.
+func (t *mapIdentityTable) noteRebuild() {
+	if !t.freePending.CompareAndSwap(false, true) {
 		return
 	}
-
-	tmpStableAttrs := make(map[StableAttr]*Inode, len(t.stableAttrs))
-	for i, v := range t.stableAttrs {
-		tmpStableAttrs[i] = v
-	}
-	t.stableAttrs = tmpStableAttrs
-
-	tmpNodes := make(map[uint64]*nodeEntry, len(t.nodes))
-	for i, v := range t.nodes {
-		tmpNodes[i] = v
-	}
-	t.nodes = tmpNodes
-
-	t.nodeCountHigh = len(t.nodes)
-
-	t.mu.Unlock()
-
-	// Run outside t.mu
-	debug.FreeOSMemory()
+	// Capture the seam so a pending timer never calls a later test's fake.
+	free := freeOSMemory
+	identityAfterFunc(freeOSMemoryDelay, func() {
+		t.freePending.Store(false) // a later rebuild can arm a new timer
+		free()
+	})
 }
 
 // registerFile hands out a fresh file handle number for f, open on the
 // node behind e. flags are the open flags (eg. syscall.O_EXCL).
 func (t *mapIdentityTable) registerFile(e *nodeEntry, f FileHandle, flags uint32) *fileEntry {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.filesMu.Lock()
+	defer t.filesMu.Unlock()
 
 	fe := &fileEntry{}
 	if len(t.freeFiles) > 0 {
@@ -302,37 +374,36 @@ func (t *mapIdentityTable) registerFile(e *nodeEntry, f FileHandle, flags uint32
 	fe.file = f
 	fe.inode = e.inode.Load()
 	e.openFiles = append(e.openFiles, fe.fh)
+	e.openCount.Add(1)
 
 	return fe
 }
 
 // firstOpenFile returns any currently-open FileHandle recorded on e,
-// plus a func that must be called once the caller is done using it.
+// plus its entry. If non-nil, the entry needs wg.Done after use.
 // Used to fake a file handle for kernel requests that don't supply one
 // (eg. GETATTR without an explicit fh).
-func (t *mapIdentityTable) firstOpenFile(e *nodeEntry) (FileHandle, func()) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *mapIdentityTable) firstOpenFile(e *nodeEntry) (FileHandle, *fileEntry) {
+	if e.openCount.Load() == 0 {
+		return nil, nil
+	}
+	t.filesMu.Lock()
+	defer t.filesMu.Unlock()
 	for _, fh := range e.openFiles {
 		fe := t.files[fh]
 		fe.wg.Add(1)
-		return fe.file, fe.wg.Done
+		return fe.file, fe
 	}
-	return nil, func() {}
+	return nil, nil
 }
 
 // detachFile unlinks the file handle fh from its owning node's entry
-// and returns that entry and the fileEntry. The fh number itself does
-// not become reusable until recycleFile is called - the caller may
-// still need to run release callbacks against the fileEntry first.
-func (t *mapIdentityTable) detachFile(nodeID uint64, fh uint64) (*nodeEntry, *fileEntry) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	e := t.nodes[nodeID]
-	if e == nil {
-		log.Panicf("detachFile: unknown node %d", nodeID)
-	}
+// and returns the fileEntry. The fh number itself does not become reusable
+// until recycleFile is called - the caller may still need to run release
+// callbacks against the fileEntry first.
+func (t *mapIdentityTable) detachFile(e *nodeEntry, fh uint64) *fileEntry {
+	t.filesMu.Lock()
+	defer t.filesMu.Unlock()
 	var entry *fileEntry
 	if fh > 0 {
 		last := len(e.openFiles) - 1
@@ -342,14 +413,15 @@ func (t *mapIdentityTable) detachFile(nodeID uint64, fh uint64) (*nodeEntry, *fi
 			t.files[e.openFiles[entry.nodeIndex]].nodeIndex = entry.nodeIndex
 		}
 		e.openFiles = e.openFiles[:last]
+		e.openCount.Add(-1)
 	}
-	return e, entry
+	return entry
 }
 
 // recycleFile marks fh as free for reuse by a future registerFile call.
 func (t *mapIdentityTable) recycleFile(fh uint32) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.filesMu.Lock()
+	defer t.filesMu.Unlock()
 	t.files[fh] = nil
 	t.freeFiles = append(t.freeFiles, fh)
 }

@@ -198,9 +198,9 @@ func TestFileFdLeak(t *testing.T) {
 	bridge := tc.rawFS.(*rawBridge)
 	tc = nil
 
-	bridge.ids.mu.Lock()
+	bridge.ids.filesMu.Lock()
 	got := len(bridge.ids.files)
-	bridge.ids.mu.Unlock()
+	bridge.ids.filesMu.Unlock()
 
 	// posixtest.FdLeak also uses 15 as a limit.
 	if want := 15; got > want {

@@ -8,6 +8,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -46,14 +47,17 @@ type fileEntry struct {
 	// nodeEntry's current state.
 	inode *Inode
 
-	// index into nodeEntry.openFiles
+	// Index into nodeEntry.openFiles, protected by mapIdentityTable.filesMu.
 	nodeIndex int
 
 	// Handle number which we communicate to the kernel.
 	fh uint32
 
+	// Owns one backing ID reference, protected by nodeEntry.backingMu.
+	backingIDRef bool
+
 	// Protects directory fields. Must be acquired before rawBridge.ids'
-	// and rawBridge.backingMu's locks.
+	// and nodeEntry.backingMu's locks.
 	mu sync.Mutex
 
 	// Directory
@@ -128,15 +132,8 @@ type rawBridge struct {
 	// adds no extra indirection or allocation.
 	ids mapIdentityTable
 
-	// backingMu protects the backingID/backingIDRefcount fields of the
-	// nodeEntry values ids hands out (see identitytable.go). It is
-	// separate from ids' own mutex because addBackingID/
-	// releaseBackingIDRef hold it across a call into the kernel.
-	// Locks for inodes must be taken before backingMu.
-	backingMu sync.Mutex
-
 	// If set, don't try to register backing file for Create/Open calls.
-	disableBackingFiles bool
+	disableBackingFiles atomic.Bool
 }
 
 // newInode creates creates new inode pointing to ops.
@@ -382,10 +379,11 @@ func (b *rawBridge) String() string {
 // use entry() when the caller also wants to reuse the *nodeEntry (eg.
 // for registerFile/addBackingID) without a second lookup.
 func (b *rawBridge) entry(nodeID uint64, fh uint64) (*nodeEntry, *fileEntry) {
-	e, f := b.ids.node(nodeID, fh)
+	e := b.ids.node(nodeID)
 	if e == nil {
 		log.Panicf("unknown node %d", nodeID)
 	}
+	f := b.ids.file(fh)
 	if f == nil {
 		// The kernel sends RELEASE only after every request that
 		// carries the handle has completed, so a released handle here
@@ -430,7 +428,7 @@ func (b *rawBridge) Lookup(ctx context.Context, header *fuse.InHeader, name stri
 // fuse_lookup_name(nodeid, ".") in fs/fuse/inode.c, which is how the
 // kernel resolves a stale NFS filehandle after a reconnect.
 func (b *rawBridge) lookupDot(ctx context.Context, nodeID uint64, out *fuse.EntryOut) fuse.Status {
-	if e, _ := b.ids.node(nodeID, 0); e != nil {
+	if e := b.ids.node(nodeID); e != nil {
 		// Known nodeid: our identity table still has it, even though
 		// the kernel's own dentry cache dropped it. Resolve to
 		// ourselves rather than treating this as a reconnect.
@@ -469,7 +467,7 @@ func (b *rawBridge) lookupDot(ctx context.Context, nodeID uint64, out *fuse.Entr
 // by fuse_get_parent while reconnecting a disconnected dentry's
 // ancestors (see NodeLookupParenter).
 func (b *rawBridge) lookupDotDot(ctx context.Context, nodeID uint64, out *fuse.EntryOut) fuse.Status {
-	e, _ := b.ids.node(nodeID, 0)
+	e := b.ids.node(nodeID)
 	if e == nil {
 		return errnoToStatus(syscall.ESTALE)
 	}
@@ -610,9 +608,7 @@ func (b *rawBridge) Create(ctx context.Context, input *fuse.CreateIn, name strin
 	}
 	out.OpenFlags = flags
 
-	b.backingMu.Lock()
-	b.addBackingID(entry, f, &out.OpenOut)
-	b.backingMu.Unlock()
+	b.addBackingID(entry, fe, &out.OpenOut)
 	child.setEntryOut(&out.EntryOut)
 	b.setEntryOutTimeout(&out.EntryOut)
 	return fuse.OK
@@ -637,9 +633,7 @@ func (b *rawBridge) Tmpfile(ctx context.Context, input *fuse.CreateIn, out *fuse
 	}
 	out.OpenFlags = flags
 
-	b.backingMu.Lock()
-	b.addBackingID(entry, f, &out.OpenOut)
-	b.backingMu.Unlock()
+	b.addBackingID(entry, fe, &out.OpenOut)
 	child.setEntryOut(&out.EntryOut)
 	b.setEntryOutTimeout(&out.EntryOut)
 	return fuse.OK
@@ -647,10 +641,7 @@ func (b *rawBridge) Tmpfile(ctx context.Context, input *fuse.CreateIn, out *fuse
 
 func (b *rawBridge) Forget(nodeid, nlookup uint64) {
 	e, _ := b.entry(nodeid, 0)
-	hasKernelRef, _, _ := e.inode.Load().removeRef(nlookup, false)
-	if !hasKernelRef {
-		b.ids.compact()
-	}
+	e.inode.Load().removeRef(nlookup, false)
 }
 
 func (b *rawBridge) GetAttr(ctx context.Context, input *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
@@ -661,9 +652,11 @@ func (b *rawBridge) GetAttr(ctx context.Context, input *fuse.GetAttrIn, out *fus
 		// The linux kernel doesnt pass along the file
 		// descriptor, so we have to fake it here.
 		// See https://github.com/libfuse/libfuse/issues/62
-		var done func()
-		f, done = b.ids.firstOpenFile(e)
-		defer done()
+		var fe *fileEntry
+		f, fe = b.ids.firstOpenFile(e)
+		if fe != nil {
+			defer fe.wg.Done()
+		}
 	}
 	return errnoToStatus(b.getattr(ctx, n, f, out))
 }
@@ -858,21 +851,24 @@ func (b *rawBridge) Open(ctx context.Context, input *fuse.OpenIn, out *fuse.Open
 		fe := b.ids.registerFile(e, f, input.Flags)
 		out.Fh = uint64(fe.fh)
 
-		b.backingMu.Lock()
-		defer b.backingMu.Unlock()
-		b.addBackingID(e, f, out)
+		b.addBackingID(e, fe, out)
 	}
 	return fuse.OK
 }
 
-// must hold backingMu
-func (b *rawBridge) addBackingID(e *nodeEntry, f FileHandle, out *fuse.OpenOut) {
-	if b.disableBackingFiles {
+func (b *rawBridge) addBackingID(e *nodeEntry, fe *fileEntry, out *fuse.OpenOut) {
+	if fe == nil || b.disableBackingFiles.Load() {
 		return
 	}
 
-	pth, ok := f.(FilePassthroughFder)
+	pth, ok := fe.file.(FilePassthroughFder)
 	if !ok {
+		return
+	}
+
+	e.backingMu.Lock()
+	defer e.backingMu.Unlock()
+	if b.disableBackingFiles.Load() {
 		return
 	}
 
@@ -887,10 +883,10 @@ func (b *rawBridge) addBackingID(e *nodeEntry, f FileHandle, out *fuse.OpenOut) 
 		id, errno := b.backing.Open(&m)
 		if errno != 0 {
 			// This happens if we're not root or CAP_PASSTHROUGH is missing.
-			b.disableBackingFiles = true
-		} else {
-			e.backingID = id
+			b.disableBackingFiles.Store(true)
+			return
 		}
+		e.backingID = id
 	}
 
 	if e.backingID != 0 {
@@ -898,15 +894,18 @@ func (b *rawBridge) addBackingID(e *nodeEntry, f FileHandle, out *fuse.OpenOut) 
 		out.OpenFlags |= fuse.FOPEN_PASSTHROUGH
 		out.OpenFlags &= ^uint32(fuse.FOPEN_KEEP_CACHE)
 		e.backingIDRefcount++
+		fe.backingIDRef = true
 	}
 }
 
-// must hold backingMu
-func (b *rawBridge) releaseBackingIDRef(e *nodeEntry) {
-	if e.backingID == 0 {
+func (b *rawBridge) releaseBackingIDRef(e *nodeEntry, fe *fileEntry) {
+	e.backingMu.Lock()
+	defer e.backingMu.Unlock()
+	if !fe.backingIDRef {
 		return
 	}
 
+	fe.backingIDRef = false
 	e.backingIDRefcount--
 	if e.backingIDRefcount == 0 {
 		errno := b.backing.Close(e.backingID)
@@ -969,7 +968,8 @@ func (b *rawBridge) SetLkw(ctx context.Context, input *fuse.LkIn) fuse.Status {
 }
 
 func (b *rawBridge) Release(ctx context.Context, input *fuse.ReleaseIn) {
-	e, f := b.releaseFileEntry(input.NodeId, input.Fh)
+	e, _ := b.entry(input.NodeId, 0)
+	f := b.ids.detachFile(e, input.Fh)
 	if f == nil {
 		return
 	}
@@ -983,15 +983,13 @@ func (b *rawBridge) Release(ctx context.Context, input *fuse.ReleaseIn) {
 		r.Release(ctx)
 	}
 
-	b.backingMu.Lock()
-	defer b.backingMu.Unlock()
-
-	b.releaseBackingIDRef(e)
+	b.releaseBackingIDRef(e, f)
 	b.ids.recycleFile(uint32(input.Fh))
 }
 
 func (b *rawBridge) ReleaseDir(ctx context.Context, input *fuse.ReleaseIn) {
-	e, f := b.releaseFileEntry(input.NodeId, input.Fh)
+	e, _ := b.entry(input.NodeId, 0)
+	f := b.ids.detachFile(e, input.Fh)
 	if f == nil {
 		return
 	}
@@ -1004,14 +1002,8 @@ func (b *rawBridge) ReleaseDir(ctx context.Context, input *fuse.ReleaseIn) {
 	putDirEntries(f.lastRead)
 	f.lastRead = nil
 
-	b.backingMu.Lock()
-	defer b.backingMu.Unlock()
-	b.releaseBackingIDRef(e)
+	b.releaseBackingIDRef(e, f)
 	b.ids.recycleFile(uint32(input.Fh))
-}
-
-func (b *rawBridge) releaseFileEntry(nid uint64, fh uint64) (*nodeEntry, *fileEntry) {
-	return b.ids.detachFile(nid, fh)
 }
 
 func (b *rawBridge) Write(ctx context.Context, input *fuse.WriteIn, data []byte) (written uint32, status fuse.Status) {

@@ -107,9 +107,7 @@ func TestForget(t *testing.T) {
 
 	bridge := rawFS.(*rawBridge)
 	liveNodes := func() int {
-		bridge.ids.mu.Lock()
-		defer bridge.ids.mu.Unlock()
-		return len(bridge.ids.nodes)
+		return identityNodeCount(&bridge.ids)
 	}
 
 	last := liveNodes()
