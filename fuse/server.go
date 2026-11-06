@@ -58,9 +58,6 @@ type Server struct {
 	// Pool for request structs.
 	reqPool sync.Pool
 
-	// Pool for raw requests data
-	readPool sync.Pool
-
 	singleReader bool
 	canSplice    bool
 	serving      atomic.Bool // for preventing duplicate Serve() calls
@@ -215,8 +212,6 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		maxReaders = maxMaxReaders
 	}
 
-	readBufSize, readBufBytes, _ := requestAccountingSizes(o.MaxWrite)
-
 	ms := &Server{
 		protocolServer: protocolServer{
 			fileSystem: fs,
@@ -230,15 +225,6 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 	}
 	ms.reqPool.New = func() any {
 		return &requestAlloc{}
-	}
-	ms.readPool.New = func() any {
-		// O_DIRECT typically requires buffers aligned to
-		// blocksize (see man 2 open), but requirements vary
-		// across file systems. Presumably, we could also fix
-		// this by reading the requests using readv.
-		buf := make([]byte, readBufBytes)
-		buf = alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(readBufSize))
-		return buf
 	}
 	mountPoint = filepath.Clean(mountPoint)
 	if !filepath.IsAbs(mountPoint) {

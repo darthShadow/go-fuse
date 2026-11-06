@@ -34,18 +34,19 @@ type fuseFD struct {
 	reqMu                sync.Mutex
 	reqReaders           int
 	inflightRequestBytes int
+	readBufs             [][]byte // LIFO free list guarded by reqMu.
 
 	// loops tracks reader goroutines servicing fd.
 	loops sync.WaitGroup
 
 	// Shared pools owned by Server.
-	reqPool  *sync.Pool
-	readPool *sync.Pool
-	buffers  *bufferPool
+	reqPool *sync.Pool
+	buffers *bufferPool
 
 	// Accounting constants, set once at server construction.
 	reqAllocBytes int
 	readBufBytes  int
+	readBufSize   int
 }
 
 // newFuseFD returns a fuseFD bound to ms and ready to read from fd.
@@ -58,16 +59,17 @@ func (ms *Server) newFuseFD(fd int) (*fuseFD, error) {
 		file.Close()
 		return nil, err
 	}
-	_, readBufBytes, reqAllocBytes := requestAccountingSizes(ms.opts.MaxWrite)
+	readBufSize, readBufBytes, reqAllocBytes := requestAccountingSizes(ms.opts.MaxWrite)
 	return &fuseFD{
 		server:        ms,
 		file:          file,
 		conn:          conn,
 		reqPool:       &ms.reqPool,
-		readPool:      &ms.readPool,
 		buffers:       &ms.buffers,
+		readBufs:      make([][]byte, 0, ms.maxReaders+1),
 		reqAllocBytes: reqAllocBytes,
 		readBufBytes:  readBufBytes,
+		readBufSize:   readBufSize,
 	}, nil
 }
 
@@ -172,10 +174,13 @@ func (r *fuseFD) readRequest() (req *requestAlloc, code Status) {
 		return nil, OK
 	}
 	r.reqReaders++
+	dest := r.getReadBufLocked()
 	r.reqMu.Unlock()
 
 	req = r.reqPool.Get().(*requestAlloc)
-	dest := r.readPool.Get().([]byte)
+	if dest == nil {
+		dest = r.newReadBuf()
+	}
 
 	req.call.fuseFD = r
 	n, err := req.call.read(dest)
@@ -259,8 +264,32 @@ func (r *fuseFD) requestBytes() int {
 	return r.reqAllocBytes + r.readBufBytes
 }
 
+func (r *fuseFD) newReadBuf() []byte {
+	// O_DIRECT typically requires buffers aligned to
+	// blocksize (see man 2 open), but requirements vary
+	// across file systems. Presumably, we could also fix
+	// this by reading the requests using readv.
+	buf := make([]byte, r.readBufBytes)
+	return alignSlice(buf, unsafe.Sizeof(WriteIn{}), logicalBlockSize, uintptr(r.readBufSize))
+}
+
+// getReadBufLocked requires reqMu to be held.
+func (r *fuseFD) getReadBufLocked() []byte {
+	if len(r.readBufs) == 0 {
+		return nil
+	}
+	last := len(r.readBufs) - 1
+	buf := r.readBufs[last]
+	r.readBufs[last] = nil
+	r.readBufs = r.readBufs[:last]
+	return buf
+}
+
+// putReadBuf requires reqMu to be held.
 func (r *fuseFD) putReadBuf(buf []byte) {
-	r.readPool.Put(buf)
+	if len(r.readBufs) < cap(r.readBufs) {
+		r.readBufs = append(r.readBufs, buf)
+	}
 	r.inflightRequestBytes -= r.readBufBytes
 }
 

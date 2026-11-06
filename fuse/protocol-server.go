@@ -59,7 +59,7 @@ func (ms *protocolServer) handleRequest(h *operationHandler, req *request) {
 	} else if !req.status.Ok() {
 		// Reply with the error from parsing the request.
 	} else if req.inHeader().NodeId == pollHackInode ||
-		req.inHeader().NodeId == FUSE_ROOT_ID && h.FileNames > 0 && req.filename() == pollHackName {
+		req.inHeader().NodeId == FUSE_ROOT_ID && h.FileNames > 0 && filenameEquals(req, pollHackName) {
 		doPollHackLookup(ms, req)
 	} else {
 		func() {
@@ -115,6 +115,19 @@ func (ms *protocolServer) handleRequest(h *operationHandler, req *request) {
 	if ms.opts.Debug {
 		ms.opts.Logger.Println(req.OutputDebug())
 	}
+}
+
+func filenameEquals(req *request, name string) bool {
+	payload := req.inPayload
+	if len(payload) < len(name) {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if payload[i] != name[i] {
+			return false
+		}
+	}
+	return len(payload) == len(name) || payload[len(name)] == 0
 }
 
 func (ms *protocolServer) addInflight(req *request) {

@@ -13,6 +13,16 @@ import (
 	"github.com/hanwen/go-fuse/v2/splice"
 )
 
+var getSplicePair = splice.Get
+
+func canSpliceReadResult(readResult ReadResult) bool {
+	if _, ok := readResult.(seekableResult); ok {
+		return true
+	}
+	_, ok := readResult.(statefulResult)
+	return ok
+}
+
 func (s *Server) setSplice() {
 	s.canSplice = splice.Resizable() && !s.opts.DisableSplice
 }
@@ -31,6 +41,10 @@ func (s *Server) setSplice() {
 // would carry the wrong total length, so we return an error and let the
 // caller fall back to a Pread-based path.
 func (r *fuseFD) trySplice(req *request, readResult ReadResult) error {
+	if !canSpliceReadResult(readResult) {
+		return errRecoverSplice
+	}
+
 	// The caller (handleRequest) already called req.serializeHeader with
 	// readResult.Size(), so req.outHeaderBuf is correct for the optimistic case.
 	total := len(req.outHeaderBuf) + len(req.outDataBuf) + readResult.Size()
@@ -40,7 +54,7 @@ func (r *fuseFD) trySplice(req *request, readResult ReadResult) error {
 		spliceFlags = f.SpliceFlags()
 	}
 
-	pair, err := splice.Get()
+	pair, err := getSplicePair()
 	if err != nil {
 		return err
 	}

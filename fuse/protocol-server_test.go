@@ -8,8 +8,38 @@ import (
 	"bytes"
 	"encoding/binary"
 	"log"
+	"strings"
 	"testing"
 )
+
+func TestFilenameEquals(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		match   string
+		want    bool
+	}{
+		{"exact without NUL", "name", "name", true},
+		{"trailing NUL", "name\x00", "name", true},
+		{"second name", "name\x00second", "name", true},
+		{"short payload", "nam", "name", false},
+		{"non-NUL suffix", "names", "name", false},
+		{"empty payload", "", "name", false},
+		{"64-byte name", strings.Repeat("n", 64), strings.Repeat("n", 64), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &request{inPayload: []byte(tt.payload)}
+			got := filenameEquals(req, tt.match)
+			if want := req.filename() == tt.match; got != want {
+				t.Errorf("filenameEquals(%q, %q) = %v, want filename() comparison %v", tt.payload, tt.match, got, want)
+			}
+			if got != tt.want {
+				t.Errorf("filenameEquals(%q, %q) = %v, want %v", tt.payload, tt.match, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestProtocolServerParse(t *testing.T) {
 	in := [][]byte{
